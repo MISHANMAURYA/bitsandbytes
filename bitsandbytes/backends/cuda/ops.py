@@ -1,3 +1,4 @@
+'''
 from collections.abc import Sequence
 import ctypes as ct
 from math import prod
@@ -519,3 +520,241 @@ def _gemv_4bit_impl(
                 ct.c_int32(blocksize),
                 stream,
             )
+'''
+
+from collections.abc import Sequence  
+import ctypes as ct  
+from math import prod  
+from typing import Optional  
+  
+import torch  
+  
+from bitsandbytes.backends import backends, ensure_backend_is_available  
+from bitsandbytes.functional import CUBLAS_Context, _cuda_device_of, _get_tensor_stream, get_ptr  
+  
+from ..._ops import register_kernel  
+from ...cextension import lib  
+  
+  
+@register_kernel("bitsandbytes::int8_linear_matmul", "cuda")  
+def _(A: torch.Tensor, B: torch.Tensor):  
+    ensure_backend_is_available(A.device.type)  
+    out = torch.empty((*A.shape[:-1], B.shape[0]), device=A.device, dtype=torch.int32)  
+    return backends[A.device.type].int8_linear_matmul(A, B, out=out)  
+  
+  
+@register_kernel("bitsandbytes::int8_linear_matmul.out", "cuda")  
+def _(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor):  
+    ensure_backend_is_available(A.device.type)  
+    backends[A.device.type].int8_linear_matmul(A, B, out=out)  
+  
+  
+def _int8_linear_matmul_impl(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor):  
+    A, B = B, A  
+  
+    shapeA = A.shape  
+    shapeB = B.shape  
+  
+    torch._check(A.dtype == torch.int8, lambda: "B must be int8")  
+    torch._check(B.dtype == torch.int8, lambda: "A must be int8")  
+    torch._check(A.ndim == 2, lambda: "Only two dimensional matrices are supported for argument B")  
+    torch._check(B.ndim in [2, 3], lambda: "Only two or three dimensional matrices are supported for argument A")  
+    torch._check(prod(shapeB) > 0, lambda: f"Input tensor dimensions need to be > 0: {shapeB}")  
+    torch._check(out.dtype == torch.int32)  
+  
+    shapeC = (*shapeB[:-1], shapeA[0])  
+    torch._check(out.shape == shapeC, lambda: f"Output shape {out.shape} does not match expected shape {shapeC}")  
+  
+    k, m = shapeA  
+    n = prod(shapeB[:-1])  
+    lda = shapeA[-1]  # Weights (outputs, inputs)  
+    ldb = shapeB[-1]  # Activations (batch, tokens, inputs)  
+    ldc = shapeC[-1]  # Output (batch, tokens, outputs)  
+  
+    torch._check(  
+        lda == ldb,  
+        lambda: f"int8_linear_matmul only supports B^T @ A. Inner dimensions do not match: B @ A = {shapeB} @ {shapeA}",  
+    )  
+  
+    # cuBLASLt does not support int8 matmul with inner dimensions that are not divisible by 4.  
+    # We'll fall back to a slower fp32 calculation in this circumstance.  
+    # Fortunately, this should not be very common.  
+    if lda % 4 != 0:  
+        result = torch.matmul(B.float(), A.float().t()).to(torch.int32)  
+        return out.copy_(result)  
+  
+    with _cuda_device_of(A):  
+        ctx = CUBLAS_Context.get_instance().get_context(A.device)  
+        ptrA = get_ptr(A)  
+        ptrB = get_ptr(B)  
+        ptrC = get_ptr(out)  
+        ptrRowScale = None  
+        m = ct.c_int32(m)  
+        n = ct.c_int32(n)  
+        k = ct.c_int32(k)  
+        lda = ct.c_int32(lda)  
+        ldb = ct.c_int32(ldb)  
+        ldc = ct.c_int32(ldc)  
+        stream = _get_tensor_stream(A)  
+  
+        has_error = lib.cigemmlt_32(ctx, m, n, k, ptrA, ptrB, ptrC, ptrRowScale, lda, ldb, ldc, stream)  
+  
+    if has_error:  
+        if has_error == 100:  
+            # `ERR_NOT_IMPLEMENTED` is defined as 100 in `ops.cu`  
+            # TODO: Warn and implement a fallback to fp32 compute?  
+            raise NotImplementedError("int8_linear_matmul not implemented!")  
+        else:  
+            raise RuntimeError(  
+                f"cublasLt ran into an error!\n\t{shapeA=}, {shapeB=}, {shapeC=}\n\t{(lda, ldb, ldc)=}\n\t{(m, n, k)=}"  
+            )  
+  
+    return out  
+  
+  
+@register_kernel("bitsandbytes::int8_mm_dequant", "cuda")  
+def _(  
+    A: torch.Tensor,  
+    row_stats: torch.Tensor,  
+    col_stats: torch.Tensor,  
+    dtype: Optional[torch.dtype] = None,  
+    bias: Optional[torch.Tensor] = None,  
+) -> torch.Tensor:  
+    ensure_backend_is_available(A.device.type)  
+    return backends[A.device.type].int8_mm_dequant(A, row_stats, col_stats, dtype=dtype, bias=bias)  
+  
+  
+@register_kernel("bitsandbytes::int8_vectorwise_quant", "cuda")  
+def _(A: torch.Tensor, threshold=0.0):  
+    ensure_backend_is_available(A.device.type)  
+    return backends[A.device.type].int8_vectorwise_quant(A, threshold)  
+  
+  
+@register_kernel("bitsandbytes::int8_double_quant", "cuda")  
+def _(  
+    A: torch.Tensor,  
+    threshold=0.0,  
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:  
+    ensure_backend_is_available(A.device.type)  
+    return backends[A.device.type].int8_double_quant(A, threshold=threshold)  
+  
+  
+def _get_col_absmax(  
+    A: torch.Tensor,  
+    threshold=0.0,  
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:  
+    torch._check(A.is_floating_point())  
+  
+    outlier_mask = None  
+  
+    absA = A.abs().view(-1, A.shape[-1])  
+  
+    if threshold > 0.0:  
+        # Filter outliers from stats when enabled  
+        outlier_mask = absA >= threshold  
+        absA.masked_fill_(outlier_mask, 0.0)  
+  
+    # shape [cols]; unsqueeze(0) gives [1,cols]  
+    col_stats = absA.amax(dim=0, keepdim=False).float()  
+  
+    return col_stats, outlier_mask  
+  
+  
+@register_kernel("bitsandbytes::quantize_blockwise", "cuda")  
+def _(A: torch.Tensor, code: torch.Tensor, blocksize: int) -> tuple[torch.Tensor, torch.Tensor]:  
+    ensure_backend_is_available(A.device.type)  
+    return backends[A.device.type].quantize_blockwise(A, code, blocksize)  
+  
+  
+@register_kernel("bitsandbytes::dequantize_blockwise", "cuda")  
+def _(A: torch.Tensor, absmax: torch.Tensor, code: torch.Tensor, blocksize: int, dtype: torch.dtype) -> torch.Tensor:  
+    ensure_backend_is_available(A.device.type)  
+    out = torch.empty_like(A, dtype=dtype)  
+    backends[A.device.type].dequantize_blockwise(A, absmax, code, blocksize, dtype, out=out)  
+    return out  
+  
+  
+@register_kernel("bitsandbytes::dequantize_blockwise.out", "cuda")  
+def _(  
+    A: torch.Tensor,  
+    absmax: torch.Tensor,  
+    code: torch.Tensor,  
+    blocksize: int,  
+    dtype: torch.dtype,  
+    out: torch.Tensor,  
+) -> None:  
+    ensure_backend_is_available(A.device.type)  
+    torch._check(out.dtype == dtype, lambda: f"Expected out.dtype == {dtype}, got {out.dtype}")  
+    torch._check(out.shape == A.shape, lambda: f"Expected out.shape == {A.shape}, got {out.shape}")  
+    backends[A.device.type].dequantize_blockwise(A, absmax, code, blocksize, dtype, out=out)  
+  
+  
+@register_kernel("bitsandbytes::quantize_4bit", "cuda")  
+def _(  
+    A: torch.Tensor, blocksize: int, quant_type: str, quant_storage: torch.dtype  
+) -> tuple[torch.Tensor, torch.Tensor]:  
+    ensure_backend_is_available(A.device.type)  
+    return backends[A.device.type].quantize_4bit(A, blocksize, quant_type, quant_storage)  
+  
+  
+@register_kernel("bitsandbytes::dequantize_4bit", "cuda")  
+def _(  
+    A: torch.Tensor,  
+    absmax: torch.Tensor,  
+    blocksize: int,  
+    quant_type: str,  
+    shape: Sequence[int],  
+    dtype: torch.dtype,  
+) -> torch.Tensor:  
+    ensure_backend_is_available(A.device.type)  
+    out = torch.empty(shape, dtype=dtype, device=A.device)  
+    backends[A.device.type].dequantize_4bit(A, absmax, blocksize, quant_type, shape, dtype, out=out)  
+    return out  
+  
+  
+@register_kernel("bitsandbytes::dequantize_4bit.out", "cuda")  
+def _(  
+    A: torch.Tensor,  
+    absmax: torch.Tensor,  
+    blocksize: int,  
+    quant_type: str,  
+    shape: Sequence[int],  
+    dtype: torch.dtype,  
+    out: torch.Tensor,  
+) -> None:  
+    ensure_backend_is_available(A.device.type)  
+    torch._check(out.shape == shape, lambda: f"Expected out.shape == {shape}, got {out.shape}")  
+    torch._check(out.dtype == dtype, lambda: f"Expected out.dtype == {dtype}, got {out.dtype}")  
+    backends[A.device.type].dequantize_4bit(A, absmax, blocksize, quant_type, shape, dtype, out=out)  
+  
+  
+@register_kernel("bitsandbytes::gemv_4bit", "cuda")  
+def _(  
+    A: torch.Tensor, B: torch.Tensor, shapeB: Sequence[int], absmax: torch.Tensor, code: torch.Tensor, blocksize: int  
+) -> torch.Tensor:  
+    ensure_backend_is_available(A.device.type)  
+    shape = (*A.shape[:-1], shapeB[0])  
+    out = torch.empty(shape, device=A.device, dtype=A.dtype)  
+    backends[A.device.type].gemv_4bit(A, B, shapeB, absmax, code, blocksize, out=out)  
+    return out  
+  
+  
+@register_kernel("bitsandbytes::gemv_4bit.out", "cuda")  
+def _(  
+    A: torch.Tensor,  
+    B: torch.Tensor,  
+    shapeB: Sequence[int],  
+    absmax: torch.Tensor,  
+    code: torch.Tensor,  
+    blocksize: int,  
+    out: torch.Tensor,  
+) -> None:  
+    ensure_backend_is_available(A.device.type)  
+    torch._check(  
+        out.shape == (*A.shape[:-1], shapeB[0]),  
+        lambda: f"Expected out.shape == {(*A.shape[:-1], shapeB[0])}, got {out.shape}",  
+    )  
+    torch._check(out.dtype == A.dtype, lambda: f"Expected out.dtype == {A.dtype}, got {out.dtype}")  
+    backends[A.device.type].gemv_4bit(A, B, shapeB, absmax, code, blocksize, out=out)  
+
+
