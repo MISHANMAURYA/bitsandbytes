@@ -644,7 +644,7 @@ void dequant_mm_int32_fp16(int *A, float *rowStats, float *colStats, half *out, 
   const int n = numRows*numCols;
   const int num_blocks = (n + num_per_block - 1) / num_per_block;
 
- hipLaunchKernelGGL(( kdequant_mm_int32_fp16<num_per_thread, threads>), dim3(num_blocks), dim3(threads), 0, stream, A, rowStats, colStats, out, bias, numRows, numCols, n);
+  hipLaunchKernelGGL(( kdequant_mm_int32_fp16<num_per_thread, threads>), dim3(num_blocks), dim3(threads), 0, stream, A, rowStats, colStats, out, bias, numRows, numCols, n);
   CUDA_CHECK_RETURN(hipPeekAtLastError());
 }
 
