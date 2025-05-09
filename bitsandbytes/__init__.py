@@ -3,6 +3,9 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Import the dynamically generated version from _version.py  (see setup.py)
+from ._version import __version__  # isort: skip # type: ignore
+
 import torch
 
 from . import research, utils
@@ -14,21 +17,28 @@ from .autograd._functions import (
     matmul_cublas,
     mm_cublas,
 )
-from .backends import register_backend
+from .backends import backends, register_backend
 from .backends.cpu import CPUBackend
 from .backends.npu import NPUBackend
 from .cextension import lib
-from .nn import modules
 
 features = {"multi_backend"}
 supported_torch_devices = {
     "cuda",  # includes ROCm
+    "npu",  # Ascend NPU
     "xpu",  # Intel GPU
     "cpu",
+    "hpu",  # Intel Gaudi
 }
 
 # Always register the CPU backend.
 register_backend("cpu", CPUBackend())
+
+# Register HPU Backend, if available
+if hasattr(torch, "hpu") and torch.hpu.is_available():
+    from .backends.hpu import HPUBackend
+
+    register_backend("hpu", HPUBackend())
 
 # Register either CUDA or ROCm backend, if available.
 # Only one of these backends can be used at a time, since the torch.device semantics are
@@ -61,6 +71,11 @@ if hasattr(torch, "xpu") and torch.xpu.is_available():
 if hasattr(torch, "npu") and torch.npu.is_available():
     register_backend("npu", NPUBackend())
 
+
+# import module after decided backends
+if backends:
+    from .nn import modules
+
 # TODO: Other potential backends:
 # XLA - Google TPU / PJRT runtime
 # HPU - Habana / Intel Gaudi
@@ -73,5 +88,3 @@ __pdoc__ = {
     "optim.optimizer.Optimizer8bit": False,
     "optim.optimizer.MockArgs": False,
 }
-
-__version__ = "0.43.3.dev"

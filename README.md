@@ -27,6 +27,20 @@ pip install .
 
 **[https://huggingface.co/docs/bitsandbytes/main](https://huggingface.co/docs/bitsandbytes/main)**
 
+## `bitsandbytes` multi-backend _alpha_ release is out!
+
+🚀 Big news! After months of hard work and incredible community contributions, we're thrilled to announce the **bitsandbytes multi-backend _alpha_ release**! 💥
+
+Now supporting:
+- 🔥 **AMD GPUs** (ROCm)
+- ⚡ **Intel CPUs** & **GPUs**
+
+We’d love your early feedback! 🙏
+
+👉 [Instructions for your `pip install` here](https://huggingface.co/docs/bitsandbytes/main/en/installation#multi-backend)
+
+We're super excited about these recent developments and grateful for any constructive input or support that you can give to help us make this a reality (e.g. helping us with the upcoming Apple Silicon backend or reporting bugs). BNB is a community project and we're excited for your collaboration 🤗
+
 ## License
 
 `bitsandbytes` is MIT licensed.

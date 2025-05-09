@@ -1,30 +1,14 @@
-"""
-extract factors the build is dependent on:
-[X] compute capability
-    [ ] TODO: Q - What if we have multiple GPUs of different makes?
-- CUDA version
-- Software:
-    - CPU-only: only CPU quantization functions (no optimizer, no matrix multiple)
-    - CuBLAS-LT: full-build 8-bit optimizer
-    - no CuBLAS-LT: no 8-bit matrix multiplication (`nomatmul`)
-
-evaluation:
-    - if paths faulty, return meaningful error
-    - else:
-        - determine CUDA version
-        - determine capabilities
-        - based on that set the default path
-"""
-
 import ctypes as ct
 import logging
 import os
 from pathlib import Path
+import re
 
 import torch
 
 from bitsandbytes.consts import DYNAMIC_LIBRARY_SUFFIX, PACKAGE_DIR
 from bitsandbytes.cuda_specs import CUDASpecs, get_cuda_specs, get_rocm_gpu_arch
+from bitsandbytes.npu_specs import get_npu_specs
 
 logger = logging.getLogger(__name__)
 
@@ -41,21 +25,12 @@ def get_cuda_bnb_library_path(cuda_specs: CUDASpecs) -> Path:
             return PACKAGE_DIR / f"libbitsandbytes_rocm{BNB_HIP_VERSION_SHORT}_nohipblaslt{DYNAMIC_LIBRARY_SUFFIX}"
         else:
             return PACKAGE_DIR / f"libbitsandbytes_rocm{BNB_HIP_VERSION_SHORT}{DYNAMIC_LIBRARY_SUFFIX}"
-    library_name = f"libbitsandbytes_cuda{cuda_specs.cuda_version_string}"
-    if not cuda_specs.has_cublaslt:
-        # if not has_cublaslt (CC < 7.5), then we have to choose _nocublaslt
-        library_name += "_nocublaslt"
-    library_name = f"{library_name}{DYNAMIC_LIBRARY_SUFFIX}"
 
+    library_name = f"libbitsandbytes_cuda{cuda_specs.cuda_version_string}{DYNAMIC_LIBRARY_SUFFIX}"
     override_value = os.environ.get("BNB_CUDA_VERSION")
+
     if override_value:
-        library_name_stem, _, library_name_ext = library_name.rpartition(".")
-        # `library_name_stem` will now be e.g. `libbitsandbytes_cuda118`;
-        # let's remove any trailing numbers:
-        library_name_stem = library_name_stem.rstrip("0123456789")
-        # `library_name_stem` will now be e.g. `libbitsandbytes_cuda`;
-        # let's tack the new version number and the original extension back on.
-        library_name = f"{library_name_stem}{override_value}.{library_name_ext}"
+        library_name = re.sub(r"cuda\d+", f"cuda{override_value}", library_name, count=1)
         logger.warning(
             f"WARNING: BNB_CUDA_VERSION={override_value} environment variable detected; loading {library_name}.\n"
             "This can be used to load a bitsandbytes version that is different from the PyTorch CUDA version.\n"
@@ -75,6 +50,9 @@ class BNBNativeLibrary:
         self._lib = lib
 
     def __getattr__(self, item):
+        return getattr(self._lib, item)
+
+    def __getitem__(self, item):
         return getattr(self._lib, item)
 
 
@@ -100,6 +78,10 @@ def get_native_library() -> BNBNativeLibrary:
             binary_path = cuda_binary_path
         else:
             logger.warning("Could not find the bitsandbytes %s binary at %r", BNB_BACKEND, cuda_binary_path)
+    npu_specs = get_npu_specs()
+    if npu_specs:
+        binary_path = PACKAGE_DIR / f"libbitsandbytes_npu{DYNAMIC_LIBRARY_SUFFIX}"
+
     logger.debug(f"Loading bitsandbytes native library from: {binary_path}")
     dll = ct.cdll.LoadLibrary(str(binary_path))
 
@@ -110,6 +92,14 @@ def get_native_library() -> BNBNativeLibrary:
 
 
 ROCM_GPU_ARCH = get_rocm_gpu_arch()
+
+try:
+    import intel_extension_for_pytorch as ipex
+
+    assert ipex._C._has_cpu() or ipex._C._has_xpu()
+    is_ipex_available = True
+except Exception:
+    is_ipex_available = False
 
 try:
     if torch.version.hip:
@@ -125,16 +115,20 @@ try:
     lib = get_native_library()
 except Exception as e:
     lib = None
-    logger.error(f"Could not load bitsandbytes native library: {e}", exc_info=True)
-    if torch.cuda.is_available():
-        logger.warning(
-            f"""
-{BNB_BACKEND} Setup failed despite {BNB_BACKEND} being available. Please run the following command to get more information:
-
-python -m bitsandbytes
-
-Inspect the output of the command and see if you can locate {BNB_BACKEND} libraries. You might need to add them
-to your LD_LIBRARY_PATH. If you suspect a bug, please take the information from python -m bitsandbytes
-and open an issue at: https://github.com/TimDettmers/bitsandbytes/issues
-""",
+    if not is_ipex_available:
+        logger.error(
+            f"Could not load bitsandbytes native library: {e}. If you use Intel CPU or XPU, please pip install intel_extension_for_pytorch",
+            exc_info=True,
         )
+        if torch.cuda.is_available():
+            logger.warning(
+                f"""
+    {BNB_BACKEND} Setup failed despite {BNB_BACKEND} being available. Please run the following command to get more information:
+
+    python -m bitsandbytes
+
+    Inspect the output of the command and see if you can locate {BNB_BACKEND} libraries. You might need to add them
+    to your LD_LIBRARY_PATH. If you suspect a bug, please take the information from python -m bitsandbytes
+    and open an issue at: https://github.com/bitsandbytes-foundation/bitsandbytes/issues
+    """,
+            )

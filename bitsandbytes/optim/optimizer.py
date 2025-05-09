@@ -5,10 +5,12 @@
 from collections import abc as container_abcs, defaultdict
 from copy import deepcopy
 from itertools import chain
+from typing import Optional
 
 import torch
 
 import bitsandbytes.functional as F
+from bitsandbytes.backends import backends
 
 
 class MockArgs:
@@ -153,12 +155,14 @@ class Optimizer8bit(torch.optim.Optimizer):
     def __setstate__(self, state):
         super().__setstate__(state)
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, move_to_device=True):
         """Load an optimizer state.
 
         Arguments:
             state_dict (`dict`):
                 An optimizer state (should be returned from a call to `state_dict`) to load.
+            move_to_device (`bool`, defaults to `True`):
+                Whether to move the optimizer's state to the device.
         """
         # deepcopy, to be consistent with module API
         state_dict = deepcopy(state_dict)
@@ -195,7 +199,8 @@ class Optimizer8bit(torch.optim.Optimizer):
             elif isinstance(value, dict):
                 for k, v in value.items():
                     if k in self.non_castable_tensor_keys:
-                        value[k] = v.to(param.device)
+                        if move_to_device:
+                            value[k] = v.to(param.device)
                     else:
                         value[k] = cast(param, v)
 
@@ -285,11 +290,11 @@ class Optimizer8bit(torch.optim.Optimizer):
 
                 self.prefetch_state(p)
                 self.update_step(group, p, gindex, pindex)
-                torch.cuda.synchronize()
+                backends[p.device.type].device_synchronize()
         if self.is_paged:
             # all paged operation are asynchronous, we need
             # to sync to make sure all tensors are in the right state
-            torch.cuda.synchronize()
+            backends[p.device.type].device_synchronize()
 
         return loss
 
@@ -299,6 +304,9 @@ class Optimizer8bit(torch.optim.Optimizer):
         config["eps"] = group["eps"]
         config["weight_decay"] = group["weight_decay"]
         config["lr"] = group["lr"]
+        config["alpha"] = group.get("alpha")
+        config["t_alpha"] = group.get("t_alpha")
+        config["t_beta3"] = group.get("t_beta3")
         config["optim_bits"] = self.args.optim_bits
         config["min_8bit_size"] = self.args.min_8bit_size
         config["percentile_clipping"] = self.args.percentile_clipping
@@ -354,6 +362,9 @@ class Optimizer2State(Optimizer8bit):
         max_unorm=0.0,
         skip_zeros=False,
         is_paged=False,
+        alpha=0.0,
+        t_alpha: Optional[int] = None,
+        t_beta3: Optional[int] = None,
     ):
         """
         Base 2-state update optimizer class.
@@ -387,6 +398,13 @@ class Optimizer2State(Optimizer8bit):
                 Whether to skip zero values for sparse gradients and models to ensure correct updates.
             is_paged (`bool`, defaults to `False`):
                 Whether the optimizer is a paged optimizer or not.
+            alpha (`float`, defaults to 0.0):
+                The alpha value for the AdEMAMix optimizer.
+            t_alpha (`Optional[int]`, defaults to `None`):
+                Number of iterations for alpha scheduling with AdEMAMix.
+            t_beta3 (`Optional[int]`, defaults to `None`):
+                Number of iterations for beta scheduling with AdEMAMix.
+
         """
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -401,7 +419,11 @@ class Optimizer2State(Optimizer8bit):
                 raise ValueError(f"Invalid beta parameter at index {i}: {betas[i]}")
         if not 0.0 <= weight_decay:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+
+        defaults = dict(
+            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, alpha=alpha, t_alpha=t_alpha, t_beta3=t_beta3
+        )
+
         super().__init__(params, defaults, optim_bits, is_paged)
 
         if args is None:
@@ -455,8 +477,8 @@ class Optimizer2State(Optimizer8bit):
 
             if config["block_wise"]:
                 n = p.numel()
-                blocks = n // 2048
-                blocks += 1 if n % 2048 > 0 else 0
+                blocks = n // 256
+                blocks += 1 if n % 256 > 0 else 0
 
                 state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
                 state["absmax2"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
@@ -508,6 +530,8 @@ class Optimizer2State(Optimizer8bit):
                 config["lr"],
                 state["state2"],
                 config["betas"][1],
+                config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
+                config["alpha"],
                 config["weight_decay"],
                 gnorm_scale,
                 state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
@@ -551,6 +575,8 @@ class Optimizer2State(Optimizer8bit):
                 state["state2"],
                 config["betas"][0],
                 config["betas"][1],
+                config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
+                config["alpha"],
                 config["eps"],
                 step,
                 config["lr"],
@@ -673,8 +699,8 @@ class Optimizer1State(Optimizer8bit):
 
             if config["block_wise"]:
                 n = p.numel()
-                blocks = n // 2048
-                blocks += 1 if n % 2048 > 0 else 0
+                blocks = n // 256
+                blocks += 1 if n % 256 > 0 else 0
 
                 state["absmax1"] = torch.zeros((blocks,), dtype=torch.float32, device=p.device)
             else:
@@ -723,6 +749,8 @@ class Optimizer1State(Optimizer8bit):
                 config["lr"],
                 None,
                 config["betas"][1],
+                0.0,
+                0.0,
                 config["weight_decay"],
                 gnorm_scale,
                 state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
@@ -764,6 +792,8 @@ class Optimizer1State(Optimizer8bit):
                 None,
                 config["betas"][0],
                 config["betas"][1],
+                0.0,
+                0.0,
                 config["eps"],
                 step,
                 config["lr"],

@@ -3,11 +3,14 @@ from typing import Optional
 import warnings
 
 import torch
+import torch.nn.functional as F
 
 from bitsandbytes.functional import (
     QuantState,
+    create_dynamic_map,
     get_4bit_type,
 )
+from bitsandbytes.utils import reverse_4bit_compress_format
 
 try:
     # to support Intel CPU/GPU (XPU) backend
@@ -15,14 +18,16 @@ try:
 
     ipex_cpu = ipex if ipex._C._has_cpu() else None
     ipex_xpu = ipex if ipex._C._has_xpu() else None
+    ipex_cpu_only = ipex._C._has_cpu() and (not ipex._C._has_xpu())
 except BaseException:
     ipex_cpu = None
     ipex_xpu = None
+    ipex_cpu_only = None
 
 
 gxx_available = False
 try:
-    subprocess.run(["g++", "--version"])
+    subprocess.run(["g++", "--version"], capture_output=True)  # hide terminal output
     gxx_available = True
 except BaseException:
     warnings.warn("g++ not found, torch.compile disabled for CPU/XPU.")
@@ -55,7 +60,7 @@ def _ipex_xpu_version_prereq(major, minor):
 
 def _maybe_torch_compile(func):
     # torch.compile requires g++ and pytorch >= 2.0
-    if gxx_available and _torch_version_prereq(2, 0):
+    if gxx_available and _torch_version_prereq(2, 0) and ipex_cpu_only:
         options = {}
         # fx_graph_cache requires pytorch >= 2.2
         if _torch_version_prereq(2, 2):
@@ -84,7 +89,6 @@ def double_quant_impl(A, col_stats=None, row_stats=None, out_col=None, out_row=N
         A tuple of output quantized per row, output quantized per column, absolute max values of
         each row of A, absolute max values of each column of A, outliers in COO format
     """
-    from ..functional import COOSparseTensor
 
     cols = A.shape[-1]
     if len(A.shape) == 3:
@@ -93,8 +97,6 @@ def double_quant_impl(A, col_stats=None, row_stats=None, out_col=None, out_row=N
         assert A.dim() == 2, f"double_quant: Input tensor should be 2d or 3d but got {A.dim()}d"
         rows = A.shape[0]
     A = A.reshape(rows, cols)
-
-    coo_tensor = None
 
     def get_row_col_stats(A):
         row_stats = torch.max(torch.abs(A), 1).values  # absolute max of each row
@@ -107,15 +109,20 @@ def double_quant_impl(A, col_stats=None, row_stats=None, out_col=None, out_row=N
     if threshold == 0.0:
         if row_stats is None or col_stats is None:
             row_stats, col_stats = get_row_col_stats(A)
+        outlier_cols = None
     else:
         outlier_indices = torch.abs(A) >= threshold  # find outliers
-        outlier_coord = outlier_indices.nonzero()  # get outlier coordinates
-        outlier_rows = outlier_coord[:, 0]  # outlier row for COO sparse tensor
-        outlier_cols = outlier_coord[:, 1]  # outlier column for COO sparse tensor
-        outlier_values = A[outlier_indices]  # outlier values for COO sparse tensor
-        coo_tensor = COOSparseTensor(
-            A.shape[0], A.shape[1], outlier_values.numel(), outlier_rows.int(), outlier_cols.int(), outlier_values
-        )
+        outlier_cols = torch.argwhere(outlier_indices.any(dim=0)).view(-1)
+        outlier_values = A[outlier_indices].clone()
+
+        # outlier_indices = torch.abs(A) >= threshold  # find outliers
+        # outlier_coord = outlier_indices.nonzero()  # get outlier coordinates
+        # outlier_rows = outlier_coord[:, 0]  # outlier row for COO sparse tensor
+        # outlier_cols = outlier_coord[:, 1]  # outlier column for COO sparse tensor
+        # outlier_values = A[outlier_indices]  # outlier values for COO sparse tensor
+        # coo_tensor = COOSparseTensor(
+        #     A.shape[0], A.shape[1], outlier_values.numel(), outlier_rows.int(), outlier_cols.int(), outlier_values
+        # )
         if row_stats is None or col_stats is None:
             A[outlier_indices] = 0  # zero out outliers
             row_stats, col_stats = get_row_col_stats(A)
@@ -123,8 +130,12 @@ def double_quant_impl(A, col_stats=None, row_stats=None, out_col=None, out_row=N
     quant_by_row = quant_to_int8(A, row_stats.unsqueeze(-1))
     quant_by_col = quant_to_int8(A, col_stats.unsqueeze(0))
 
-    if coo_tensor is not None:
+    if outlier_cols is not None:
         A[outlier_indices] = outlier_values  # restore outliers for later use
+
+        if rows > 1:
+            # zero out outlier columns for all rows
+            quant_by_row[:, outlier_cols] = 0
 
     if out_row is not None:
         out_row.copy_(quant_by_row)
@@ -135,23 +146,26 @@ def double_quant_impl(A, col_stats=None, row_stats=None, out_col=None, out_row=N
     else:
         out_col = quant_by_col
     # Return float stats to align with CUDA impl
-    return out_row, out_col, row_stats.float(), col_stats.float(), coo_tensor
+    return out_row, out_col, row_stats.float(), col_stats.float(), outlier_cols
 
 
-def igemmlt_impl(A, B, SA=None, SB=None, out=None, Sout=None, dtype=torch.int32):
+def int8_linear_matmul_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    dtype=torch.int32,
+) -> torch.Tensor:
     """
     Do GEMMM computation. Data type: int8 * int8 -> int32.
     Args:
         A Activation of linear, data type is int8
         B Weight of linear, data type is int8
-        SA Not used for CPU/XPU
-        SB Not used for CPU/XPU
         out Specified output tensor if it is not None
-        Sout Not used for CPU/XPU but returned as is
         dtype Data type of output
     Return:
         A tuple of GEMM result in dtype and Sout
     """
+
     assert A.dtype == torch.int8
     assert B.dtype == torch.int8
     if out is not None:
@@ -180,8 +194,10 @@ def igemmlt_impl(A, B, SA=None, SB=None, out=None, Sout=None, dtype=torch.int32)
 
     A_reshaped = A.reshape(m, k)
 
-    # torch._int_mm is available on CPU since torch 2.4
-    if _torch_version_prereq(2, 4):
+    # torch._int_mm is available on CPU since torch 2.4, XPU since torch 2.6
+    if (A.device.type == "cpu" and _torch_version_prereq(2, 4)) or (
+        A.device.type == "xpu" and _torch_version_prereq(2, 6)
+    ):
         C = torch._int_mm(A_reshaped, B.T).to(dtype)
     else:
         C = torch.matmul(A_reshaped.float(), B.t().float()).to(dtype)
@@ -194,33 +210,27 @@ def igemmlt_impl(A, B, SA=None, SB=None, out=None, Sout=None, dtype=torch.int32)
     else:
         out = C
 
-    return out, Sout
+    return out
 
 
 @_maybe_torch_compile
-def mm_dequant_impl(
-    A,
-    quant_state,
-    row_stats,
-    col_stats,
-    out=None,
-    new_row_stats=None,
-    new_col_stats=None,
-    bias=None,
+def int8_mm_dequant_impl(
+    A: torch.Tensor,
+    row_stats: torch.Tensor,
+    col_stats: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
     compute_dtype=torch.float32,
     output_dtype=torch.float32,
-):
+) -> torch.Tensor:
     """
     Dequant and add bias
     out = A_int32 * (abs_max_A * abs_max_B) / 127 * 127 + bias
     Args:
         A The output of int8 gemm, whose dtype is int32
-        quant_state Not used for CPU
         row_stats Absolute max value of each row of input (A) of gemm
         col_stats Absolute max value of each row of weight (B) of gemm
         out Output buffer
-        new_row_stats Not used for CPU/XPU
-        new_col_stats Not used for CPU/XPU
         bias Bias of linear
         compute_dtype Data type for computation
         output_dtype Data type for output
@@ -233,8 +243,10 @@ def mm_dequant_impl(
         out_shape = (out_shape[0] * out_shape[1], out_shape[2])
 
     if compute_dtype not in [torch.float32, torch.bfloat16]:
-        warnings.warn(f"mm_dequant_{A.device}: compute_dtype {compute_dtype} is not supported, will use float instead")
-        compute_dtype = torch.float32
+        warnings.warn(
+            f"mm_dequant_{A.device}: compute_dtype {compute_dtype} is not supported, will use bfloat16 instead"
+        )
+        compute_dtype = torch.bfloat16
     A_reshaped = A.reshape(out_shape).to(compute_dtype)
     row_stats = row_stats.reshape(-1).unsqueeze(-1).to(compute_dtype)
     col_stats = col_stats.reshape(-1).unsqueeze(0).to(compute_dtype)
@@ -276,8 +288,9 @@ FP4_QUANT_TABLE = {
     0.8333333: 3,  # 0b0011
 }
 
+INT8_QUANT_TABLE = create_dynamic_map().tolist()
 
-@_maybe_torch_compile
+
 def quantize_4bit_impl(
     A: Tensor,
     absmax: Tensor = None,
@@ -285,6 +298,7 @@ def quantize_4bit_impl(
     blocksize=64,
     compress_statistics=False,
     quant_type="nf4",
+    quant_storage=torch.uint8,
 ) -> Tensor:
     """
     Quantize tensor A in blocks of 4-bit values.
@@ -303,6 +317,8 @@ def quantize_4bit_impl(
         The blocksize used in quantization.
     quant_type : str
         The 4-bit quantization data type {fp4, nf4}, only nf4 is supported now
+    quant_storage: torch.dtype
+        We can use bytes to convert storage type.
 
     Returns
     -------
@@ -311,7 +327,7 @@ def quantize_4bit_impl(
     tuple(torch.Tensor, torch.Size, torch.dtype, int):
         The quantization state to undo the quantization.
     """
-    if quant_type not in ["nf4", "fp4"]:
+    if quant_type not in ["nf4", "fp4", "int8"]:
         raise NotImplementedError(f"4-bit quantization data type {quant_type} is not implemented for CPU/XPU.")
     if quant_type == "fp4":
         warnings.warn("fp4 quantization is currently slow on CPU/XPU. Please Use nf4 instead for better performance.")
@@ -342,7 +358,7 @@ def quantize_4bit_impl(
         scaled_A_rem = torch.clamp(A_reshaped[n - rem :] * (1 / absmax[-1]), -1, 1)
         scaled_A = torch.cat([scaled_A, scaled_A_rem], dim=0)
     # map [-1, 1] to nf4/fp4
-    out_uint8 = torch.empty(scaled_A.shape, dtype=torch.uint8)
+    out_uint8 = torch.empty(scaled_A.shape, dtype=torch.uint8, device=A.device)
     if quant_type == "nf4":
         for i in range(len(NF4_QUANT_TABLE)):
             out_uint8[scaled_A > NF4_QUANT_TABLE[i]] = i
@@ -352,14 +368,35 @@ def quantize_4bit_impl(
         for key, val in FP4_QUANT_TABLE.items():
             out_uint8[abs_scaled_A > key] = val
         out_uint8 += sign.to(torch.uint8) * 8
-    if out_uint8.size(-1) % 2:
-        out_uint8 = torch.nn.functional.pad(out_uint8, (0, 1), value=0)
-    out[:] = out_uint8[1::2].bitwise_left_shift(4).bitwise_or_(out_uint8[::2])
+    elif quant_type == "int8":
+        map = torch.tensor(INT8_QUANT_TABLE, device=scaled_A.device)
+        diff = torch.abs(scaled_A.unsqueeze(-1) - map)
+        out_uint8 = torch.argmin(diff, dim=-1).to(torch.uint8).to(scaled_A.device)
 
-    code = get_4bit_type(quant_type, device=A.device)
+    if quant_type == "int8":
+        out = out_uint8
+        code = torch.Tensor(INT8_QUANT_TABLE).to(A.device)
+    else:
+        if out_uint8.size(-1) % 2:
+            out_uint8 = torch.nn.functional.pad(out_uint8, (0, 1), value=0)
+        out[:] = out_uint8[::2].bitwise_left_shift(4).bitwise_or_(out_uint8[1::2])
+        code = get_4bit_type(quant_type, device=A.device)
 
     if compress_statistics:
-        raise NotImplementedError("bnb_4bit_use_double_quant is not supported yet for CPU/XPU")
+        offset = absmax.mean()
+        absmax -= offset
+        qabsmax, state2 = quantize_4bit_impl(absmax, blocksize=256, quant_type="int8")
+        del absmax
+        state = QuantState(
+            absmax=qabsmax,
+            shape=input_shape,
+            dtype=A.dtype,
+            blocksize=blocksize,
+            code=code,
+            quant_type=quant_type,
+            offset=offset,
+            state2=state2,
+        )
     else:
         state = QuantState(
             absmax=absmax,
@@ -370,10 +407,29 @@ def quantize_4bit_impl(
             quant_type=quant_type,
         )
 
-    return out.unsqueeze(0), state
+    if quant_storage != torch.uint8:
+        bytes_value = out.cpu().numpy().tobytes()
+        out = torch.frombuffer(bytes_value, dtype=quant_storage).to(A.device)
+
+    return out.reshape(-1, 1), state
 
 
-@_maybe_torch_compile
+def dequant_8bit(A, offset, quant_state):
+    assert A.dtype == torch.uint8
+    absmax = quant_state.code[A.reshape(-1).int()]
+    blocks = absmax.shape[-1] // 256
+    res = absmax.shape[-1] % 256
+    if res != 0:
+        absmax = F.pad(absmax, (0, 256 - res), mode="constant", value=0)
+    absmax = (absmax.view(-1, 256) * quant_state.absmax.view(-1, 1)).to(quant_state.dtype).reshape(-1)
+    absmax = absmax[: blocks * 256 + res]
+    absmax = absmax.reshape(A.shape)
+    absmax += offset
+    return absmax
+
+
+# Compile will fail in torch.frombuffer
+# @_maybe_torch_compile
 def dequantize_4bit_impl(
     A: Tensor,
     quant_state=None,
@@ -383,8 +439,7 @@ def dequantize_4bit_impl(
     quant_type="nf4",
 ) -> Tensor:
     """
-    Dequantizes FP4 blockwise quantized values.
-
+    Dequantizes 4-bit blockwise quantized values.
     Dequantizes the tensor A with maximum absolute values absmax in blocks of size blocksize.
 
     Parameters
@@ -400,21 +455,19 @@ def dequantize_4bit_impl(
     blocksize : int
         The blocksize used in quantization.
     quant_type : str
-        The 4-bit quantization data type {fp4, nf4}, only nf4 is supported now
-
+        The 4-bit quantization data type {fp4, nf4}
 
     Returns
     -------
     torch.Tensor:
         Dequantized tensor.
     """
-
-    if A.shape[0] == 1:
-        transpose = False
-        A = A.squeeze(0)
-    elif A.shape[1] == 1:
-        transpose = True
-        A = A.squeeze(1)
+    transpose = True if A.shape[0] == 1 else False
+    A = A.reshape(-1)
+    device = A.device
+    if A.dtype != torch.uint8:
+        bytes_value = A.cpu().numpy().tobytes()
+        A = torch.frombuffer(bytes_value, dtype=torch.uint8).to(device)
 
     if quant_state is None:
         assert absmax is not None and out is not None
@@ -436,25 +489,21 @@ def dequantize_4bit_impl(
         )
 
     if quant_state.nested:
-        raise NotImplementedError("bnb_4bit_use_double_quant is not supported yet for CPU/XPU")
+        absmax = dequant_8bit(absmax, quant_state.offset, quant_state.state2)
 
-    if ipex_cpu and _ipex_cpu_version_prereq(2, 3) and hasattr(quant_state, "op_context"):
-        assert quant_state.op_context is not None
-        A = quant_state.op_context.to_public(quant_state.op_context.get_weight())
-        A = A.reshape(-1)
-        absmax = quant_state.op_context.get_scales().reshape(-1)
+    if ipex_cpu_only and _ipex_cpu_version_prereq(2, 5) and getattr(quant_state, "ipex", False):
+        ipex_weight = torch.ops.ipex_prepack.woq_linear_unpack_weight(A, "nf4", quant_state.shape, 2)
+        A = reverse_4bit_compress_format(ipex_weight)
+        quant_state.ipex = False
 
-    if out is None:
-        out = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=A.device)
-
-    n = out.numel()
     # Map nf4 to [-1, 1]
-    out_uint8 = torch.empty(A.size(0) * 2, dtype=torch.uint8, device=A.device)
-    out_uint8[::2] = A.bitwise_and(0xF)
-    out_uint8[1::2] = A.bitwise_right_shift(4)
-    out_dq = torch.empty(out_uint8.shape).to(quant_state.dtype)
-    for i in range(len(quant_state.code)):
-        out_dq[out_uint8 == i] = quant_state.code[i]
+    out_dq = torch.empty(A.size(0) * 2, dtype=torch.int32, device=A.device)
+    n = out_dq.numel()
+    out_dq[1::2] = A & 0xF
+    out_dq[::2] = A >> 4
+    # quant_state.code is fp32, cast to quant_state dtype to avoid the mismatch issue
+    quant_state.code = quant_state.code.to(quant_state.dtype)
+    out_dq = quant_state.code[out_dq]
 
     # Apply scales
     if out_dq.numel() != n:
@@ -464,12 +513,17 @@ def dequantize_4bit_impl(
     blocks += 1 if n % blocksize > 0 else 0
     rem = n % blocksize
     has_rem = rem > 0
-    out_reshaped = out.reshape(-1)
-    out_reshaped[: n - rem] = (out_dq[: n - rem].view(-1, blocksize) * absmax[: blocks - has_rem].view(-1, 1)).reshape(
-        -1
-    )
+
     if has_rem:
+        if out is None:
+            out = torch.empty(quant_state.shape, dtype=quant_state.dtype, device=A.device)
+        out_reshaped = out.reshape(-1)
+        out_reshaped[: n - rem] = (
+            out_dq[: n - rem].view(-1, blocksize) * absmax[: blocks - has_rem].view(-1, 1)
+        ).reshape(-1)
         out_reshaped[n - rem :] = out_dq[n - rem :] * absmax[-1]
+    else:
+        out = (out_dq.view(-1, blocksize) * absmax.view(-1, 1)).reshape(quant_state.shape).to(quant_state.dtype)
 
     # take transpose here because weight is transposed (again) for computation
     if transpose:
@@ -510,11 +564,25 @@ def gemm_4bit_impl(
     torch.Tensor:
         GEMM output tensor.
     """
-    if ipex_cpu and _ipex_cpu_version_prereq(2, 3) and hasattr(state, "op_context"):
-        assert state.op_context is not None
-        output = torch.ops.torch_ipex.ipex_woq_linear(A, state.op_context.get_data_handle())
+    if getattr(state, "ipex", False):
+        # compute_dtype: 1 indicates fp16, 2 indicates bf16
+        compute_dtype = 2 if A.dtype == torch.bfloat16 else 1
+        output = torch.ops.torch_ipex.woq_linear(
+            A,
+            B,
+            "nf4",
+            state.shape,
+            state.new_scales,
+            state.new_zeros,
+            None,
+            None,
+            state.blocksize,
+            compute_dtype,
+            1,
+            state.compensation,
+        )
     else:
-        dqB = dequantize_4bit_impl(B, state, blocksize=state.blocksize).t()
+        dqB = dequantize_4bit_impl(B, state, blocksize=state.blocksize)
         output = torch.matmul(A, dqB.to(A.dtype))
     if out is not None:
         out.copy_(output)

@@ -17,9 +17,9 @@ from bitsandbytes.functional import QuantState
 from bitsandbytes.optim import GlobalOptimManager
 from bitsandbytes.utils import (
     INVERSE_LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING,
-    LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING,
     OutlierTracer,
     enable_ipex_fusion,
+    reverse_4bit_compress_format,
 )
 
 T = TypeVar("T", bound="torch.nn.Module")
@@ -278,6 +278,7 @@ class Params4bit(torch.nn.Parameter):
         quantized_stats: Dict[str, Any],
         requires_grad: bool = False,
         device="cuda",
+        module: Optional["Linear4bit"] = None,
         **kwargs,
     ) -> "Params4bit":
         self = torch.Tensor._make_subclass(cls, data.to(device))
@@ -289,6 +290,10 @@ class Params4bit(torch.nn.Parameter):
         self.bnb_quantized = True
 
         self.quant_storage = data.dtype
+        self.module = module
+
+        if self.module is not None:
+            self.module.quant_state = self.quant_state
 
         return self
 
@@ -314,6 +319,15 @@ class Params4bit(torch.nn.Parameter):
     def cpu(self, non_blocking: bool = False):
         return self.to(device="cpu", non_blocking=non_blocking)
 
+    def npu(self, device: Optional[Union[int, device, str]] = None, non_blocking: bool = False):
+        # `torch.Tensor.to(<int num>)` is not supported by `torch_npu` (see this [issue](https://github.com/Ascend/pytorch/issues/16)).
+        if isinstance(device, int):
+            device = f"npu:{device}"
+        return self.to(device="npu" if device is None else device, non_blocking=non_blocking)
+
+    def xpu(self, non_blocking: bool = False):
+        return self.to(device="xpu", non_blocking=non_blocking)
+
     @overload
     def to(
         self: T,
@@ -331,7 +345,7 @@ class Params4bit(torch.nn.Parameter):
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
 
-        if device is not None and device.type in ["cuda", "cpu"] and not self.bnb_quantized:
+        if device is not None and device.type in ["cuda", "cpu", "npu", "xpu", "hpu"] and not self.bnb_quantized:
             return self._quantize(device)
         else:
             if self.quant_state is not None:
@@ -348,6 +362,23 @@ class Params4bit(torch.nn.Parameter):
             )
 
             return new_param
+
+
+def fix_4bit_weight_quant_state_from_module(module: Union["Embedding4bit", "Linear4bit"]):
+    if getattr(module.weight, "quant_state", None) is not None:
+        return
+
+    if getattr(module, "quant_state", None) is None:
+        warnings.warn(
+            "FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first.",
+        )
+
+    # the quant state got lost when the parameter got converted. This happens for example for fsdp
+    # since we registered the module, we can recover the state here
+    assert module.weight.shape[1] == 1
+    if not isinstance(module.weight, Params4bit):
+        module.weight = Params4bit(module.weight, quant_storage=module.quant_storage, bnb_quantized=True)
+    module.weight.quant_state = module.quant_state
 
 
 class Linear4bit(nn.Linear):
@@ -417,6 +448,7 @@ class Linear4bit(nn.Linear):
         # self.persistent_buffers = []  # TODO consider as way to save quant state
         self.compute_dtype = compute_dtype
         self.compute_type_is_set = False
+        self.ipex_linear_is_set = False
         self.quant_state = None
         self.quant_storage = quant_storage
 
@@ -445,51 +477,46 @@ class Linear4bit(nn.Linear):
         save weight and bias,
         then fill state_dict with components of quant_state
         """
-        if (
-            getattr(self.weight, "quant_state", None) is not None
-            and getattr(self.weight.quant_state, "op_context", None) is not None
-        ):
-            context = self.weight.quant_state.op_context
-            self.weight.data = context.to_public(context.get_weight()).reshape([1, -1])
+        if getattr(self.weight, "quant_state", None) is not None and getattr(self.weight.quant_state, "ipex", False):
+            if self.weight.device.type == "cpu":
+                original_weight = torch.ops.ipex_prepack.woq_linear_unpack_weight(
+                    self.weight, "nf4", self.weight.quant_state.shape, 2
+                )
+                self.weight.data = reverse_4bit_compress_format(original_weight.data)
+            elif self.weight.device.type == "xpu":
+                self.weight.data = reverse_4bit_compress_format(self.weight.data.reshape(1, -1))
+
+            self.weight.quant_state.ipex = False
+            self.ipex_linear_is_set = False
 
         super()._save_to_state_dict(destination, prefix, keep_vars)  # saving weight and bias
 
         if getattr(self.weight, "quant_state", None) is not None:
-            if (
-                self.weight.quant_state.absmax.shape.numel() == 0
-                and getattr(self.weight.quant_state, "op_context", None) is not None
-            ):
-                self.weight.quant_state.absmax = context.get_scales().reshape(-1)
-                delattr(self.weight.quant_state, "op_context")
             for k, v in self.weight.quant_state.as_dict(packed=True).items():
                 destination[prefix + "weight." + k] = v if keep_vars else v.detach()
 
-    def forward(self, x: torch.Tensor):
-        # Check if ipex fusion can be used
+    def set_ipex_linear(self, x: torch.Tensor):
         if (
-            x.device.type == "cpu"
-            and not hasattr(self.weight.quant_state, "op_context")
+            not getattr(self.weight.quant_state, "ipex", False)
+            and self.weight.data.dtype == torch.uint8
             and self.weight.quant_state.shape[1] % self.weight.quant_state.blocksize == 0
             and self.weight.quant_state.quant_type == "nf4"
         ):
-            enable_ipex_fusion(self.weight, self.weight.quant_state)
+            if x.device.type == "xpu" or (x.device.type == "cpu" and not self.training and x.requires_grad == False):
+                enable_ipex_fusion(self, x)
+
+    def forward(self, x: torch.Tensor):
+        # Check if ipex fusion can be used
+        if not self.ipex_linear_is_set:
+            self.set_ipex_linear(x)
+            self.ipex_linear_is_set = True
+
+        fix_4bit_weight_quant_state_from_module(self)
 
         # weights are cast automatically as Int8Params, but the bias has to be cast manually
         if self.bias is not None and self.bias.dtype != x.dtype:
             self.bias.data = self.bias.data.to(x.dtype)
 
-        if getattr(self.weight, "quant_state", None) is None:
-            if getattr(self, "quant_state", None) is not None:
-                # the quant state got lost when the parameter got converted. This happens for example for fsdp
-                # since we registered the module, we can recover the state here
-                assert self.weight.shape[1] == 1
-                if not isinstance(self.weight, Params4bit):
-                    self.weight = Params4bit(self.weight, quant_storage=self.quant_storage, bnb_quantized=True)
-                self.weight.quant_state = self.quant_state
-            else:
-                print(
-                    "FP4 quantization state not initialized. Please call .cuda() or .to(device) on the LinearFP4 layer first.",
-                )
         if not self.compute_type_is_set:
             self.set_compute_type(x)
             self.compute_type_is_set = True
@@ -499,11 +526,8 @@ class Linear4bit(nn.Linear):
             x = x.to(self.compute_dtype)
 
         bias = None if self.bias is None else self.bias.to(self.compute_dtype)
-        out = bnb.matmul_4bit(x, self.weight.t(), bias=bias, quant_state=self.weight.quant_state)
-
-        out = out.to(inp_dtype)
-
-        return out
+        weight = self.weight.t() if len(self.weight.shape) == 2 else self.weight
+        return bnb.matmul_4bit(x, weight, bias=bias, quant_state=self.weight.quant_state).to(inp_dtype)
 
 
 class LinearFP4(Linear4bit):
@@ -588,11 +612,11 @@ class LinearNF4(Linear4bit):
 class Int8Params(torch.nn.Parameter):
     def __new__(
         cls,
-        data=None,
+        data: Optional[torch.Tensor] = None,
         requires_grad=True,
         has_fp16_weights=False,
-        CB=None,
-        SCB=None,
+        CB: Optional[torch.Tensor] = None,
+        SCB: Optional[torch.Tensor] = None,
     ):
         if data is None:
             data = torch.empty(0)
@@ -606,12 +630,9 @@ class Int8Params(torch.nn.Parameter):
         if self.has_fp16_weights:
             return super().cuda(device)
         else:
-            # we store the 8-bit rows-major weight
-            # we convert this weight to the turning/ampere weight during the first inference pass
+            # We quantize the weight and store in 8bit row-major
             B = self.data.contiguous().half().cuda(device)
-            CB, CBt, SCB, SCBt, coo_tensorB = bnb.functional.double_quant(B)
-            del CBt
-            del SCBt
+            CB, SCB, _ = bnb.functional.int8_vectorwise_quant(B)
             self.data = CB
             self.CB = CB
             self.SCB = SCB
@@ -632,7 +653,20 @@ class Int8Params(torch.nn.Parameter):
 
     def cpu(self):
         # we store the 8-bit rows-major weight
-        B = self.data.contiguous().bfloat16().cpu()
+        B = self.data.contiguous().to(torch.bfloat16).cpu()
+        CB, CBt, SCB, SCBt, coo_tensorB = bnb.functional.double_quant(B)
+        if CBt is not None:
+            del CBt
+        if SCBt is not None:
+            del SCBt
+        self.data = CB
+        self.CB = CB
+        self.SCB = SCB
+        return self
+
+    def xpu(self, device):
+        # we store the 8-bit rows-major weight
+        B = self.data.contiguous().to(torch.float16).xpu(device)
         CB, CBt, SCB, SCBt, coo_tensorB = bnb.functional.double_quant(B)
         if CBt is not None:
             del CBt
@@ -660,24 +694,30 @@ class Int8Params(torch.nn.Parameter):
     def to(self, *args, **kwargs):
         device, dtype, non_blocking, convert_to_format = torch._C._nn._parse_to(*args, **kwargs)
 
-        if device.type == "cuda" and self.data.device.type == "cpu":
-            return self.cuda(device)
-        elif device.type == "cpu":
-            if self.data.dtype == torch.int8:
-                self.CB = self.data
-                return self
-            else:
-                return self.cpu()
-        else:
-            new_param = Int8Params(
-                super().to(device=device, dtype=dtype, non_blocking=non_blocking),
-                requires_grad=self.requires_grad,
-                has_fp16_weights=self.has_fp16_weights,
-            )
-            new_param.CB = self.CB
-            new_param.SCB = self.SCB
+        if device is not None:
+            if device.type == "cuda" and self.data.device.type == "cpu":
+                return self.cuda(device)
+            elif device.type == "cpu":
+                if self.data.dtype == torch.int8:
+                    self.CB = self.data
+                else:
+                    return self.cpu()
+            elif device.type == "xpu":
+                if self.data.dtype == torch.int8:
+                    self.data = self.data.contiguous()
+                    self.CB = self.data
+                if self.data.device.type == "cpu":
+                    return self.xpu(device)
 
-            return new_param
+        new_param = Int8Params(
+            super().to(device=device, dtype=dtype, non_blocking=non_blocking),
+            requires_grad=self.requires_grad,
+            has_fp16_weights=self.has_fp16_weights,
+        )
+        new_param.CB = self.CB
+        new_param.SCB = self.SCB
+
+        return new_param
 
 
 def maybe_rearrange_weight(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
@@ -700,6 +740,191 @@ def maybe_rearrange_weight(state_dict, prefix, local_metadata, strict, missing_k
     if weight_format != "row":
         tile_indices = get_tile_inds(weight_format, weight.device)
         state_dict[f"{prefix}weight"] = undo_layout(weight, tile_indices)
+
+
+class Embedding8bit(nn.Embedding):
+    """
+    This class implements [LLM.int8()](https://arxiv.org/abs/2208.07339) algorithm for embedding layer
+
+    Quantization API is similar to Linear8bitLt:
+    ```python
+    import torch
+    import torch.nn as nn
+
+    from bitsandbytes.nn import Embedding8bit
+
+    fp16_module = nn.Embedding(128, 64)
+    int8_module = Embedding8bit(128, 64)
+
+    int8_module.load_state_dict(fp16_module.state_dict())
+
+    int8_module = int8_module.to(0) # Quantization happens here
+    ```
+    """
+
+    def __init__(self, num_embeddings, embedding_dim, device=None, dtype=None):
+        super().__init__(num_embeddings, embedding_dim, device=device, dtype=dtype)
+        self.dtype = self.weight.data.dtype
+
+        self.weight = Int8Params(self.weight.data, has_fp16_weights=False, requires_grad=False)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        raise NotImplementedError("Saving Embedding8bit module is not implemented")
+
+    def forward(self, input: Tensor) -> Tensor:
+        if not hasattr(self.weight, "SCB"):
+            raise RuntimeError("Embedding layer is not quantized. Please call .cuda() or .to(device) first.")
+
+        rows = self.weight.data
+        row_stats = self.weight.SCB
+
+        assert rows.shape == (self.num_embeddings, self.embedding_dim)
+        assert row_stats.shape == (self.num_embeddings,)
+
+        compressed_output = F.embedding(input, rows)
+        compressed_output_stats = F.embedding(input, row_stats.view(self.num_embeddings, 1))
+
+        output = compressed_output * (compressed_output_stats / 127.0)
+
+        return output.to(self.dtype)
+
+
+class Embedding4bit(nn.Embedding):
+    """
+    This is the base class similar to Linear4bit. It implements the 4-bit quantization algorithm presented in
+    [QLoRA](https://arxiv.org/abs/2305.14314) for embeddings.
+
+    Quantization API is similar to Linear4bit:
+    ```python
+    import torch
+    import torch.nn as nn
+
+    from bitsandbytes.nn import Embedding4bit
+
+    fp16_module = nn.Embedding(128, 64)
+    quantized_module = Embedding4bit(128, 64)
+
+    quantized_module.load_state_dict(fp16_module.state_dict())
+
+    quantized_module = quantized_module.to(0) # Quantization happens here
+    ```
+    """
+
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        dtype=None,
+        quant_type="fp4",
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        super().__init__(num_embeddings, embedding_dim, device=device, dtype=dtype)
+        self.dtype = self.weight.data.dtype
+
+        self.weight = Params4bit(
+            self.weight.data,
+            requires_grad=False,
+            compress_statistics=None,
+            quant_type=quant_type,
+            quant_storage=quant_storage,
+            module=self,
+        )
+
+        blocksize = self.weight.blocksize
+
+        if embedding_dim % blocksize != 0:
+            warnings.warn(
+                f"Embedding size {embedding_dim} is not divisible by block size {blocksize}. "
+                "This will lead to slow inference.",
+            )
+
+    def _forward_with_partial_dequantize(self, input: Tensor):
+        assert self.embedding_dim % self.weight.quant_state.blocksize == 0
+
+        w_4bit_uint8 = self.weight.data.view(torch.uint8).view(self.num_embeddings * self.embedding_dim // 2, 1)
+
+        output_4bit = torch.nn.functional.embedding(
+            weight=w_4bit_uint8.view(self.num_embeddings, self.embedding_dim // 2),
+            input=input,
+        ).view(-1, 1)
+        assert output_4bit.shape == (input.numel() * self.embedding_dim // 2, 1)
+
+        blocks_per_emb = self.embedding_dim // self.weight.blocksize
+
+        absmax = self.weight.quant_state.absmax
+        assert absmax.shape == (self.num_embeddings * blocks_per_emb,)
+
+        output_absmax = torch.nn.functional.embedding(
+            weight=absmax.view(self.num_embeddings, blocks_per_emb),
+            input=input,
+        ).view(
+            -1,
+        )
+        assert output_absmax.shape == (input.numel() * blocks_per_emb,)
+
+        output_quant_state = copy.deepcopy(self.weight.quant_state)
+        output_quant_state.absmax = output_absmax
+        output_quant_state.shape = torch.Size((*input.shape, self.embedding_dim))
+
+        output = bnb.functional.dequantize_4bit(output_4bit, output_quant_state)
+        assert output.shape == (*input.shape, self.embedding_dim)
+
+        return output.to(self.dtype)
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        raise NotImplementedError("Saving Embedding4bit module is not implemented")
+
+    def forward(self, input: Tensor) -> Tensor:
+        fix_4bit_weight_quant_state_from_module(self)
+
+        if self.embedding_dim % self.weight.quant_state.blocksize == 0:
+            return self._forward_with_partial_dequantize(input)
+
+        dequantized_weight = bnb.functional.dequantize_4bit(self.weight.data, self.weight.quant_state)
+
+        return torch.nn.functional.embedding(
+            weight=dequantized_weight,
+            input=input,
+        ).to(self.dtype)
+
+
+class EmbeddingFP4(Embedding4bit):
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        dtype=None,
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            dtype=dtype,
+            quant_type="fp4",
+            quant_storage=quant_storage,
+            device=device,
+        )
+
+
+class EmbeddingNF4(Embedding4bit):
+    def __init__(
+        self,
+        num_embeddings,
+        embedding_dim,
+        dtype=None,
+        quant_storage=torch.uint8,
+        device=None,
+    ):
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            dtype=dtype,
+            quant_type="nf4",
+            quant_storage=quant_storage,
+            device=device,
+        )
 
 
 class Linear8bitLt(nn.Linear):
@@ -740,7 +965,6 @@ class Linear8bitLt(nn.Linear):
         output_features: int,
         bias=True,
         has_fp16_weights=True,
-        memory_efficient_backward=False,
         threshold=0.0,
         index=None,
         device=None,
@@ -757,13 +981,12 @@ class Linear8bitLt(nn.Linear):
                 Whether the linear class uses the bias term as well.
         """
         super().__init__(input_features, output_features, bias, device)
-        assert not memory_efficient_backward, "memory_efficient_backward is no longer required and the argument is deprecated in 0.37.0 and will be removed in 0.39.0"
         self.state = bnb.MatmulLtState()
         self.index = index
 
         self.state.threshold = threshold
         self.state.has_fp16_weights = has_fp16_weights
-        self.state.memory_efficient_backward = memory_efficient_backward
+
         if threshold > 0.0 and not has_fp16_weights:
             self.state.use_pool = True
 
@@ -780,29 +1003,19 @@ class Linear8bitLt(nn.Linear):
         param_from_weight = getattr(self.weight, scb_name)
         # case 2: self.init_8bit_state was called, SCB is in self.state
         param_from_state = getattr(self.state, scb_name)
-        # case 3: SCB is in self.state, weight layout reordered after first forward()
-        layout_reordered = self.state.CxB is not None
 
         key_name = prefix + f"{scb_name}"
+
+        # We now only save in row-major. This format information is stored for backwards compatibility.
         format_name = prefix + "weight_format"
 
         if not self.state.has_fp16_weights:
             if param_from_weight is not None:
                 destination[key_name] = param_from_weight if keep_vars else param_from_weight.detach()
                 destination[format_name] = torch.tensor(0, dtype=torch.uint8)
-            elif param_from_state is not None and not layout_reordered:
-                destination[key_name] = param_from_state if keep_vars else param_from_state.detach()
-                destination[format_name] = torch.tensor(0, dtype=torch.uint8)
             elif param_from_state is not None:
                 destination[key_name] = param_from_state if keep_vars else param_from_state.detach()
-                weights_format = self.state.formatB
-                # At this point `weights_format` is an str
-                if weights_format not in LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING:
-                    raise ValueError(f"Unrecognized weights format {weights_format}")
-
-                weights_format = LINEAR_8BIT_WEIGHTS_FORMAT_MAPPING[weights_format]
-
-                destination[format_name] = torch.tensor(weights_format, dtype=torch.uint8)
+                destination[format_name] = torch.tensor(0, dtype=torch.uint8)
 
     def _load_from_state_dict(
         self,
@@ -860,12 +1073,9 @@ class Linear8bitLt(nn.Linear):
 
         out = bnb.matmul(x, self.weight, bias=self.bias, state=self.state)
 
-        if not self.state.has_fp16_weights:
-            if self.state.CB is not None and self.state.CxB is not None:
-                # we converted 8-bit row major to turing/ampere format in the first inference pass
-                # we no longer need the row-major weight
-                del self.state.CB
-                self.weight.data = self.state.CxB
+        if not self.state.has_fp16_weights and self.state.CB is not None:
+            self.weight.data = self.state.CB
+
         return out
 
 

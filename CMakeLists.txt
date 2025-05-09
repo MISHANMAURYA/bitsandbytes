@@ -3,12 +3,11 @@
 #   For  GCC: `cmake -B build . && cmake --build build`
 #   For MSVC: `cmake -B build . && cmake --build build --config Release`
 # You can also use the following options and variables
-#  - COMPUTE_BACKEND: Set to `cpu`, `cuda`, `hip` or `mps` to select the backend
-#  - NO_CUBLASLT: Default OFF, will skip building/linking CUBLASLT support
+#  - COMPUTE_BACKEND: Set to `cpu`, `cuda`, `hip`, `mps` or `npu` to select the backend
 #  - CUDA_VERSION: The expected CUDA version, for sanity checking. The actual version
 #                  is whatever CMake finds on your path.
 #  - COMPUTE_CAPABILITY: Which GPU Arch/Compute codes to provide to NVCC.
-#                        Separate by semicolons, i.e. `-DCOMPUTE_CAPABILITY=89;90`
+#                        Separate by semicolons, i.e. `-DCOMPUTE_CAPABILITY=89;90;100;120`
 #                        Check your compute capability here: https://developer.nvidia.com/cuda-gpus
 #  - PTXAS_VERBOSE: Pass the `-v` option to the PTX Assembler
 cmake_minimum_required(VERSION 3.22.1)
@@ -29,11 +28,12 @@ set(CUDA_FILES csrc/ops.cu csrc/kernels.cu)
 set(HIP_FILES csrc/ops.hip csrc/kernels.hip)
 set(MPS_FILES csrc/mps_ops.mm)
 set(METAL_FILES csrc/mps_kernels.metal)
+set(NPU_FILES csrc/npu_ops.cpp)
 # C++ sources are always included
 list(APPEND SRC_FILES ${CPP_FILES})
 
-set(COMPUTE_BACKEND "cpu" CACHE STRING "The compute backend to use (cpu, cuda, hip, mps)")
-set_property(CACHE COMPUTE_BACKEND PROPERTY STRINGS cpu cuda hip mps)
+set(COMPUTE_BACKEND "cpu" CACHE STRING "The compute backend to use (cpu, cuda, hip, mps, npu)")
+set_property(CACHE COMPUTE_BACKEND PROPERTY STRINGS cpu cuda hip mps npu)
 option(PTXAS_VERBOSE "Pass through -v flag to PTX Assembler" OFF)
 
 if(APPLE)
@@ -48,7 +48,6 @@ if(${COMPUTE_BACKEND} STREQUAL "cuda")
     if(APPLE)
         message(FATAL_ERROR "CUDA is not supported on macOS" )
     endif()
-    option(NO_CUBLASLT "Disable CUBLAS" OFF)
     set(BUILD_CUDA ON)
     set(BUILD_HIP OFF)
     set(BUILD_MPS OFF)
@@ -61,7 +60,6 @@ elseif(${COMPUTE_BACKEND} STREQUAL "hip")
     set(BUILD_CUDA OFF)
     set(BUILD_HIP ON)
     set(BUILD_MPS OFF)
-    message(STATUS "NO_CUBLASLT := ${NO_CUBLASLT}")
 elseif(${COMPUTE_BACKEND} STREQUAL "mps")
     if(NOT APPLE)
         message(FATAL_ERROR "MPS is only supported on macOS" )
@@ -69,6 +67,11 @@ elseif(${COMPUTE_BACKEND} STREQUAL "mps")
     set(BUILD_CUDA OFF)
     set(BUILD_HIP OFF)
     set(BUILD_MPS ON)
+elseif(${COMPUTE_BACKEND} STREQUAL "npu")
+    set(BUILD_CUDA OFF)
+    set(BUILD_HIP OFF)
+    set(BUILD_MPS OFF)
+    set(BUILD_NPU ON)
 else()
     set(BUILD_CUDA OFF)
     set(BUILD_HIP OFF)
@@ -82,6 +85,11 @@ if(BUILD_CUDA)
     # This needs to be added *before* we try to enable the CUDA language so CMake's compiler check passes.
     if(MSVC AND MSVC_VERSION VERSION_GREATER_EQUAL 1940)
         string(APPEND CMAKE_CUDA_FLAGS " --allow-unsupported-compiler")
+
+        # This is needed to build with VS2022 17.11+ and CUDA < 12.4.
+        if (MSVC_VERSION VERSION_GREATER_EQUAL 1941)
+            string(APPEND CMAKE_CUDA_FLAGS " -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH")
+        endif()
     endif()
 
     enable_language(CUDA) # This will fail if CUDA is not found
@@ -133,6 +141,17 @@ if(BUILD_CUDA)
             list(APPEND CMAKE_CUDA_ARCHITECTURES_ALL 89 90)
             list(APPEND CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR 90)
         endif()
+        # CUDA 12.7 adds support for Blackwell B100.
+        if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.7")
+            list(APPEND CMAKE_CUDA_ARCHITECTURES_ALL 100)
+            list(APPEND CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR 100)
+        endif()
+
+        # CUDA 12.8 adds support for RTX 50 Blackwell.
+        if (CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND CMAKE_CUDA_ARCHITECTURES_ALL 101 120)
+            list(APPEND CMAKE_CUDA_ARCHITECTURES_ALL_MAJOR 101 120)
+        endif()
     endif()
 
     string(APPEND CMAKE_CUDA_FLAGS " --use_fast_math")
@@ -174,9 +193,6 @@ if(BUILD_CUDA)
     list(APPEND SRC_FILES ${CUDA_FILES})
 
     string(APPEND BNB_OUTPUT_NAME "_cuda${CUDA_VERSION_SHORT}")
-    if(NO_CUBLASLT)
-        string(APPEND BNB_OUTPUT_NAME "_nocublaslt")
-    endif()
     add_compile_definitions(BUILD_CUDA)
 elseif(BUILD_HIP)
     enable_language(HIP)
@@ -227,6 +243,33 @@ elseif(BUILD_MPS)
                 COMMENT "Compiling Metal kernels"
                 VERBATIM)
     add_custom_target(metallib DEPENDS "bitsandbytes/bitsandbytes.metallib")
+elseif(BUILD_NPU)
+    list(APPEND SRC_FILES ${NPU_FILES})
+
+    set(SOC_VERSION "Ascend910B4" CACHE STRING "system on chip type")
+    set(ASCEND_CANN_PACKAGE_PATH $ENV{ASCEND_HOME_PATH} CACHE
+        STRING "ASCEND CAN package installation directory"
+    )
+
+    # ${KERNEL_FILES} are used to compile library, push files written by ascendc in ${KERNEL_FILES}.
+    # ref to cmake/npu.cmake ascendc_library, cmake/cpu.cmake add_library
+    # file(GLOB KERNEL_FILES ${CMAKE_CURRENT_SOURCE_DIR}/csrc/npu_kernels.cpp)
+    file(GLOB KERNEL_FILES csrc/npu_kernels.cpp)
+
+    if(EXISTS ${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake)
+        set(ASCENDC_CMAKE_DIR ${ASCEND_CANN_PACKAGE_PATH}/compiler/tikcpp/ascendc_kernel_cmake)
+    elseif(EXISTS ${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake)
+        set(ASCENDC_CMAKE_DIR ${ASCEND_CANN_PACKAGE_PATH}/tools/tikcpp/ascendc_kernel_cmake)
+    else()
+        message(FATAL_ERROR "ascendc_kernel_cmake does not exist ,please check whether the can package is installed")
+    endif()
+    include(${ASCENDC_CMAKE_DIR}/ascendc.cmake)
+
+    # ascendc_library use to add kernel file to generate ascendc library
+    ascendc_library(ascendc_kernels_npu STATIC ${KERNEL_FILES})
+
+    string(APPEND BNB_OUTPUT_NAME "_npu")
+    add_compile_definitions(BUILD_NPU)
 else()
     string(APPEND BNB_OUTPUT_NAME "_cpu")
     set(GPU_SOURCES)
@@ -244,19 +287,17 @@ endif()
 
 set_source_files_properties(${CPP_FILES} PROPERTIES LANGUAGE CXX)
 add_library(bitsandbytes SHARED ${SRC_FILES})
-target_compile_features(bitsandbytes PUBLIC cxx_std_14)
+if(BUILD_NPU)
+    target_compile_features(bitsandbytes PUBLIC cxx_std_17)
+else()
+    target_compile_features(bitsandbytes PUBLIC cxx_std_14)
+endif()
 target_include_directories(bitsandbytes PUBLIC csrc include)
 
 
 if(BUILD_CUDA)
     target_include_directories(bitsandbytes PUBLIC ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(bitsandbytes PUBLIC CUDA::cudart CUDA::cublas CUDA::cusparse)
-    if(NO_CUBLASLT)
-        target_compile_definitions(bitsandbytes PUBLIC NO_CUBLASLT)
-    else()
-        target_link_libraries(bitsandbytes PUBLIC CUDA::cublasLt)
-    endif()
-
+    target_link_libraries(bitsandbytes PUBLIC CUDA::cudart CUDA::cublas CUDA::cublasLt CUDA::cusparse)
     set_target_properties(bitsandbytes
         PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -300,6 +341,10 @@ endif()
 if(BUILD_MPS)
     add_dependencies(bitsandbytes metallib)
     target_link_libraries(bitsandbytes objc "-framework Foundation" "-framework Metal" "-framework MetalPerformanceShaders" "-framework MetalPerformanceShadersGraph")
+endif()
+if(BUILD_NPU)
+    target_compile_options(bitsandbytes PRIVATE -O2 -std=c++17)
+    target_link_libraries(bitsandbytes PRIVATE $<BUILD_INTERFACE:host_intf_pub> ascendc_kernels_npu)
 endif()
 
 if(WIN32)
