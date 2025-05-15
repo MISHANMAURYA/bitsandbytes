@@ -556,12 +556,7 @@ def _int8_linear_matmul_out_entry(A: torch.Tensor, B: torch.Tensor, out: torch.T
 
 
 def _int8_linear_matmul_impl(A: torch.Tensor, B: torch.Tensor, out: torch.Tensor):
-    """
-    Implementation for int8_linear_matmul (A @ B.T).
-    A: Activations (e.g., [batch, tokens, features_in])
-    B: Weights (e.g., [features_out, features_in])
-    out: Output tensor (e.g., [batch, tokens, features_out])
-    """
+
     shapeA_orig = A.shape
     shapeB_orig = B.shape
 
