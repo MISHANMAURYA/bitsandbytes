@@ -123,7 +123,7 @@ logger = logging.getLogger(__name__)
 HIP_ENVIRONMENT = False
 BNB_HIP_VERSION = 0
 BNB_HIP_VERSION_SHORT = ""
-BNB_BACKEND = "CUDA" # Default to CUDA
+BNB_BACKEND = "CUDA" 
 ROCM_GPU_ARCH = "unknown"
 
 
