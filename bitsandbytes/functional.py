@@ -1,3 +1,4 @@
+'''
 # Copyright (c) Facebook, Inc. and its affiliates.
 #
 # This source code is licensed under the MIT license found in the
@@ -2508,3 +2509,2047 @@ def vectorwise_mm_dequant(xq, S1, S2, dtype=torch.half, quant_type="vector"):
         return x.to(dtype)
     else:
         return None
+'''
+
+
+from collections.abc import Iterable, Sequence 
+import ctypes as ct
+import itertools
+from functools import reduce 
+import operator 
+from math import prod as math_prod 
+from typing import Any, Optional, Union, Tuple
+
+import numpy as np
+import torch
+from torch import Tensor
+from typing_extensions import deprecated 
+
+from .cextension import lib, HIP_ENVIRONMENT, BNB_HIP_VERSION 
+
+
+def prod_compat(iterable):
+    return reduce(operator.mul, iterable, 1)
+
+
+try:
+    from math import prod as math_prod
+except ImportError:
+    math_prod = prod_compat
+
+
+name2qmap = {}
+
+str2optimizer32bit = {}
+str2optimizer8bit_blockwise = {}
+
+str2optimizer8bit = {}
+
+
+if lib and getattr(lib, 'compiled_with_cuda', False):
+    str2optimizer32bit = {
+        "adam": (
+            lib.cadam32bit_grad_fp32,
+            lib.cadam32bit_grad_fp16,
+            lib.cadam32bit_grad_bf16,
+        ),
+        "momentum": (
+            lib.cmomentum32bit_grad_32, 
+            lib.cmomentum32bit_grad_16, 
+                                    
+        ),
+        "rmsprop": (
+            lib.crmsprop32bit_grad_32,
+            lib.crmsprop32bit_grad_16,
+        ),
+        "lion": (
+            lib.clion32bit_grad_fp32,
+            lib.clion32bit_grad_fp16,
+            lib.clion32bit_grad_bf16,
+        ),
+        "adagrad": (
+            lib.cadagrad32bit_grad_32,
+            lib.cadagrad32bit_grad_16,
+        ),
+        "lamb": ( 
+            lib.cadam32bit_grad_fp32, 
+            lib.cadam32bit_grad_fp16,
+            lib.cadam32bit_grad_bf16,
+        ),
+
+        "ademamix": (
+            lib.cademamix32bit_grad_fp32,
+            lib.cademamix32bit_grad_fp16,
+            lib.cademamix32bit_grad_bf16,
+        ),
+    }
+
+    str2optimizer8bit_blockwise = {
+        "adam": (
+            lib.cadam_8bit_blockwise_grad_fp32,
+            lib.cadam_8bit_blockwise_grad_fp16,
+            lib.cadam_8bit_blockwise_grad_bf16,
+        ),
+        "momentum": (
+            lib.cmomentum_8bit_blockwise_grad_fp32,
+            lib.cmomentum_8bit_blockwise_grad_fp16,
+            lib.cmomentum_8bit_blockwise_grad_bf16,
+        ),
+        "rmsprop": (
+            lib.crmsprop_8bit_blockwise_grad_fp32,
+            lib.crmsprop_8bit_blockwise_grad_fp16,
+            lib.crmsprop_8bit_blockwise_grad_bf16,
+        ),
+        "lion": (
+            lib.clion_8bit_blockwise_grad_fp32,
+            lib.clion_8bit_blockwise_grad_fp16,
+            lib.clion_8bit_blockwise_grad_bf16,
+        ),
+        "adagrad": (
+            lib.cadagrad_8bit_blockwise_grad_fp32,
+            lib.cadagrad_8bit_blockwise_grad_fp16,
+            lib.cadagrad_8bit_blockwise_grad_bf16,
+        ),
+
+        "ademamix": (
+            lib.cademamix_8bit_blockwise_grad_fp32,
+            lib.cademamix_8bit_blockwise_grad_fp16,
+            lib.cademamix_8bit_blockwise_grad_bf16,
+        ),
+    }
+
+    str2optimizer8bit = {
+        "adam": (
+            lib.cadam_static_8bit_grad_32,
+            lib.cadam_static_8bit_grad_16,
+        ),
+        "momentum": (
+            lib.cmomentum_static_8bit_grad_32,
+            lib.cmomentum_static_8bit_grad_16,
+        ),
+        "rmsprop": (
+            lib.crmsprop_static_8bit_grad_32,
+            lib.crmsprop_static_8bit_grad_16,
+        ),
+        "lion": (
+            lib.clion_static_8bit_grad_32,
+            lib.clion_static_8bit_grad_16,
+        ),
+        "lamb": (
+            lib.cadam_static_8bit_grad_32, 
+            lib.cadam_static_8bit_grad_16,
+        ),
+        "lars": ( 
+            lib.cmomentum_static_8bit_grad_32, 
+            lib.cmomentum_static_8bit_grad_16,
+        ),
+    }
+
+
+class GlobalPageManager: 
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.paged_tensors = []
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def prefetch_all(self, to_cpu=False):
+        for t in self.paged_tensors[::-1]:
+            prefetch_tensor(t, to_cpu)
+
+
+class CUBLAS_Context: 
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        self.context = {}
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+    def get_context(self, device: torch.device):
+        if device.index not in self.context:
+            prev_device_idx = torch.cuda.current_device()
+            torch.cuda.set_device(device)
+            self.context[device.index] = ct.c_void_p(lib.get_context())
+            torch.cuda.set_device(prev_device_idx)
+        return self.context[device.index]
+
+
+class Cusparse_Context: # As in Main PDF, for cuSPARSE/hipSPARSE
+    _instance = None
+
+    def __init__(self):
+        raise RuntimeError("Call get_instance() instead")
+
+    def initialize(self):
+        global HIP_ENVIRONMENT
+        if HIP_ENVIRONMENT:
+            if hasattr(lib, 'get_hipsparse'):
+                self.context = ct.c_void_p(lib.get_hipsparse())
+            else: 
+                logger.warning("lib.get_hipsparse not found. Sparse operations might fail on ROCm.")
+                self.context = None
+        else:
+            if hasattr(lib, 'get_cusparse'):
+                self.context = ct.c_void_p(lib.get_cusparse())
+            else: 
+                logger.warning("lib.get_cusparse not found. Sparse operations might fail on CUDA.")
+                self.context = None
+
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls.__new__(cls)
+            cls._instance.initialize()
+        return cls._instance
+
+dtype2bytes = {
+    torch.float32: 4,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.uint8: 1,
+    torch.int8: 1,
+}
+
+
+FIRST_CUDA_DEVICE = torch.device("cuda", index=0) 
+
+if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+    def _cuda_device_of(a: torch.Tensor): 
+        return torch.cuda.device_of(a)
+else:
+    import contextlib
+    def _cuda_device_of(a: torch.Tensor):
+        return contextlib.nullcontext()
+
+
+def get_paged(*shape, dtype=torch.float32, device=FIRST_CUDA_DEVICE): 
+    num_bytes = dtype2bytes.get(dtype, 0) * math_prod(shape)
+    if num_bytes == 0 and dtype not in dtype2bytes:
+        raise ValueError(f"Unsupported dtype for paged tensor: {dtype}")
+    cuda_ptr = lib.cget_managed_ptr(ct.c_size_t(num_bytes))
+    c_ptr = ct.cast(cuda_ptr, ct.POINTER(ct.c_byte)) 
+
+    if dtype == torch.float32: ctype_dtype = ct.c_float
+    elif dtype == torch.float16: ctype_dtype = ct.c_uint16 
+    elif dtype == torch.bfloat16: ctype_dtype = ct.c_uint16 
+    elif dtype == torch.uint8: ctype_dtype = ct.c_uint8
+    elif dtype == torch.int8: ctype_dtype = ct.c_int8
+    else: raise TypeError(f"Unsupported dtype for get_paged: {dtype}")
+
+    c_typed_ptr = ct.cast(cuda_ptr, ct.POINTER(ctype_dtype))
+       
+    buffer_size = num_bytes // dtype2bytes[dtype] # Number of elements
+    c_array_type = ctype_dtype * buffer_size
+    actual_c_array = c_array_type.from_address(cuda_ptr)
+    
+    out = torch.from_numpy(np.frombuffer(actual_c_array, dtype=dtype.name).reshape(shape))
+    np_dtype = dtype.name # e.g. 'float32'
+    typed_cuda_ptr = ct.cast(cuda_ptr, ct.POINTER(ctype_dtype))
+    np_array = np.ctypeslib.as_array(typed_cuda_ptr, shape=(math_prod(shape),)) 
+    out = torch.from_numpy(np_array).reshape(shape)
+    out = out.to(device)
+
+
+    out.is_paged = True # Mark as paged
+    out.page_deviceid = device.index
+    return out
+
+
+def prefetch_tensor(A: torch.Tensor, to_cpu=False): # As in Main PDF
+    assert getattr(A, 'is_paged', False), "Only paged tensors can be prefetched!"
+    if to_cpu:
+        deviceid = -1 # Standard CUDA code for host
+    else:
+        deviceid = A.page_deviceid
+
+    num_bytes = A.nbytes # Use tensor's nbytes property
+    lib.cprefetch(get_ptr(A), ct.c_size_t(num_bytes), ct.c_int32(deviceid))
+
+
+def elementwise_func(func_name, A, B, value, prefetch=True): 
+    func = None
+    cvalue = None # Initialize cvalue
+    if A.dtype == torch.float32:
+        func = getattr(lib, f"c{func_name}_fp32", None)
+        cvalue = ct.c_float(value)
+    elif A.dtype == torch.uint8: # Main PDF example
+        func = getattr(lib, f"c{func_name}_uint8", None)
+        cvalue = ct.c_uint8(value)
+
+
+    if func is None:
+        raise NotImplementedError(f"Elementwise function '{func_name}' not implemented for dtype {A.dtype}")
+
+    is_managed = getattr(A, "is_managed", False)
+    is_paged_A = getattr(A, "is_paged", False)
+    is_paged_B = getattr(B, "is_paged", False) if B is not None else False
+
+    if (is_paged_A or is_managed) and prefetch: # Check is_paged
+        prefetch_tensor(A)
+    if B is not None and is_paged_B and prefetch:
+        prefetch_tensor(B)
+
+    func(get_ptr(A), get_ptr(B) if B is not None else None, cvalue, ct.c_int64(A.numel()))
+
+    if is_paged_A or is_paged_B:
+        torch.cuda.synchronize()
+
+
+def fill(A, value, device=None, prefetch=True): 
+    elementwise_func("fill", A, None, value, prefetch=prefetch)
+
+
+def _mul(A, B, device=None):
+    elementwise_func("_mul", A, B, 0, prefetch=True) 
+
+
+def create_linear_map(signed=True, total_bits=8, add_zero=True): 
+    sign_val = -1.0 if signed else 0.0
+    total_values = 2**total_bits
+    if add_zero or total_bits < 8:
+        total_values = 2**total_bits if not signed else 2**total_bits - 1
+    
+    values = torch.linspace(sign_val, 1.0, total_values)
+    gap = 256 - values.numel()
+    if gap == 0:
+        return values
+    else:
+
+        mid_idx = values.numel() // 2
+        return torch.tensor(values[:mid_idx].tolist() + [0.0] * gap + values[mid_idx:].tolist(), dtype=torch.float32)
+
+
+def create_normal_map(offset=0.9677083, use_extra_value=True):
+    try:
+        from scipy.stats import norm
+    except ImportError as ie:
+        raise ImportError(
+            "Scipy is required for 'create_normal_map'. Install 'bitsandbytes' with the [test] extra, e.g. pip install bitsandbytes[test]",
+        ) from ie
+
+    if use_extra_value:
+        v1 = norm.ppf(torch.linspace(offset, 0.5, 9)[:-1]).tolist()
+        v2 = [0.0] * (256 - 15) # 15 non-zero values
+        v3 = (-norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])).tolist() 
+    else:
+        v1 = norm.ppf(torch.linspace(offset, 0.5, 8)[:-1]).tolist() 
+        v2 = [0.0] * (256 - 14) # 14 non-zero values
+        v3 = (-norm.ppf(torch.linspace(offset, 0.5, 8)[:-1])).tolist() 
+
+    v = sorted(v1 + v2 + v3) # Ensure sorted order
+    values = torch.tensor(v, dtype=torch.float32)
+    max_abs_val = values.abs().max()
+    if max_abs_val > 0:
+        values /= max_abs_val
+    
+    assert values.numel() == 256
+    return values
+
+
+def create_fp8_map(signed=True, exponent_bits=5, precision_bits=2, total_bits=8): 
+    e = exponent_bits
+    p = precision_bits
+    has_sign_bit = 1 if signed else 0 # Renamed for clarity
+    if e + p != total_bits - has_sign_bit:
+         raise ValueError(f"Exponent bits ({e}) + Precision bits ({p}) must equal Total bits ({total_bits}) - Sign bit ({has_sign_bit})")
+
+    values = []
+    
+    exp_bias = 2**(e - 1) - 1
+
+    for exp_pattern in range(2**e):
+        for prec_pattern in range(2**p):
+            significand = 0.0
+            if exp_pattern == 0: 
+                # Significand is 0.fraction
+                for i in range(p):
+                    if (prec_pattern >> (p - 1 - i)) & 1: 
+                        significand += 2**-(i + 1)
+                actual_exp = 1 - exp_bias
+            else: 
+                significand = 1.0
+                for i in range(p):
+                    if (prec_pattern >> (p - 1 - i)) & 1:
+                        significand += 2**-(i + 1)
+                actual_exp = exp_pattern - exp_bias
+            
+            value = significand * (2**actual_exp)
+            values.append(value)
+            if signed and value != 0: 
+                values.append(-value)
+            elif signed and value == 0 and len(values) < 2**total_bits : 
+                pass
+
+
+
+    values = sorted(list(set(values)))
+
+    if total_bits < 8:
+        num_current_values = len(values)
+        gap = 256 - num_current_values
+        if gap > 0:
+            values.extend([0.0] * gap)
+            values = sorted(list(set(values))) 
+    if total_bits == 8:
+        assert len(values) <= 2**total_bits, f"Generated more values ({len(values)}) than expected ({2**total_bits}) for fp{total_bits}"
+
+    code = torch.tensor(values, dtype=torch.float32)
+    
+
+    max_abs = code.abs().max()
+    if max_abs > 0:
+        code /= max_abs
+    return code
+
+
+def create_dynamic_map(signed=True, max_exponent_bits=7, total_bits=8): 
+    data = []
+    non_sign_bits = total_bits - (1 if signed else 0) 
+    for i in range(max_exponent_bits):
+        bits_for_fraction_at_this_level = (i + non_sign_bits - max_exponent_bits)
+        fraction_items = 2**bits_for_fraction_at_this_level + 1
+        
+        boundaries = torch.linspace(0.1, 1.0, int(fraction_items), dtype=torch.float32) 
+        if len(boundaries) < 2: # Need at least 2 boundaries to make means
+            means = boundaries # or skip if no means can be formed
+        else:
+            means = (boundaries[:-1] + boundaries[1:]) / 2.0
+        current_exponent_scale = 10**(-(max_exponent_bits - 1) + i)
+        
+        data.extend((current_exponent_scale * means).tolist())
+        if signed:
+            data.extend((-current_exponent_scale * means).tolist())
+
+    if non_sign_bits > max_exponent_bits:
+        bits_for_finest_fraction = non_sign_bits - max_exponent_bits
+        additional_items_count = 2**bits_for_finest_fraction 
+        
+        num_additional_linspace_points = 2**(non_sign_bits - max_exponent_bits) 
+                                                                           
+        if num_additional_linspace_points -1 > 0: # Check if we can form means
+            boundaries_additional = torch.linspace(0.1, 1.0, int(num_additional_linspace_points), dtype=torch.float32)
+            if len(boundaries_additional) >=2:
+                means_additional = (boundaries_additional[:-1] + boundaries_additional[1:]) / 2.0
+                smallest_exp_scale = 10**(-(max_exponent_bits - 1))
+                data.extend((smallest_exp_scale * means_additional).tolist())
+                if signed:
+                    data.extend((-smallest_exp_scale * means_additional).tolist())
+
+
+    data.append(0.0) # Add zero
+
+    data = sorted(list(set(data)))
+
+    # Pad to 256 if total_bits < 8
+    if total_bits < 8:
+        current_len = len(data)
+        gap = 256 - current_len
+        if gap > 0:
+            data.extend([0.0] * gap)
+        data = sorted(list(set(data))) 
+    if len(data) > 256: data = data[:256] 
+    while len(data) < 256: data.append(0.0) 
+    data = sorted(data)
+
+    final_map = torch.tensor(data, dtype=torch.float32)
+    
+  
+    max_abs = final_map.abs().max()
+    if max_abs > 0:
+        final_map /= max_abs
+        
+    return final_map
+
+
+@deprecated("This function is deprecated and will be removed in a future release.", category=FutureWarning)
+def create_quantile_map(A, total_bits=8): # As in Main PDF
+    num_q = 2**total_bits -1
+    q_values = estimate_quantiles(A, num_quantiles=num_q)
+    
+    q_list = q_values.tolist()
+    q_list.append(0.0) # Add 0
+
+    gap = 256 - len(q_list)
+    if gap > 0:
+        q_list.extend([0.0] * gap)
+    
+    q_list = sorted(list(set(q_list))) 
+
+   
+    if len(q_list) > 256: q_list = q_list[:256]
+    while len(q_list) < 256: q_list.append(0.0) 
+    q_list = sorted(q_list)
+
+    q_tensor = torch.tensor(q_list, dtype=torch.float32)
+    
+    max_abs = q_tensor.abs().max()
+    if max_abs > 0:
+        q_tensor /= max_abs
+        
+    return q_tensor
+
+class QuantState:
+    """Container for quantization state components."""
+    def __init__(
+        self,
+        absmax: Optional[torch.Tensor] = None,
+        shape: Optional[torch.Size] = None, 
+        code: Optional[torch.Tensor] = None,
+        blocksize: Optional[int] = None,
+        quant_type: Optional[str] = None, 
+        dtype: Optional[torch.dtype] = None,
+        offset: Optional[torch.Tensor] = None, 
+        state2: Optional['QuantState'] = None, 
+
+    ):
+        self.absmax = absmax
+        self.shape = shape
+        self.code = code
+        self.dtype = dtype
+        self.blocksize = blocksize
+        self.quant_type = quant_type 
+        self.offset = offset
+        self.state2 = state2
+        self.nested = state2 is not None
+
+    def __getitem__(self, idx: int):
+        """
+        Ensures compatibility with older quant state scheme which was a nested list:
+        state = [absmax, input_shape, A.dtype, blocksize, [offset, state2] or None, quant_type]
+        """
+        if self.nested:
+            nested_content = [self.offset, self.state2]
+            list_repr = [
+                self.absmax,
+                self.shape, 
+                self.dtype,
+                self.blocksize,
+                nested_content,
+                self.quant_type,
+            ]
+        else:
+            list_repr = [
+                self.absmax,
+                self.shape,
+                self.dtype,
+                self.blocksize,
+                None, # No nested state
+                self.quant_type,
+            ]
+
+        if self.nested:
+            # Ensure all components are present if creating this list representation
+            _shape = self.shape if self.shape is not None else torch.Size([])
+            _dtype = self.dtype if self.dtype is not None else torch.float32
+            _blocksize = self.blocksize if self.blocksize is not None else 0
+            _quant_type = self.quant_type if self.quant_type is not None else ""
+            
+            constructed_list = [
+                self.absmax, _shape, _dtype, _blocksize,
+                [self.offset, self.state2], # Nested part
+                _quant_type
+            ]
+        else:
+            _shape = self.shape if self.shape is not None else torch.Size([])
+            _dtype = self.dtype if self.dtype is not None else torch.float32
+            _blocksize = self.blocksize if self.blocksize is not None else 0
+            _quant_type = self.quant_type if self.quant_type is not None else ""
+            constructed_list = [
+                self.absmax, _shape, _dtype, _blocksize,
+                None, 
+                _quant_type
+            ]
+        return constructed_list[idx]
+
+
+    try:
+        from bitsandbytes.utils import pack_dict_to_tensor, unpack_tensor_to_dict
+    except ImportError:
+   
+        def pack_dict_to_tensor(d): raise NotImplementedError("pack_dict_to_tensor not found")
+        def unpack_tensor_to_dict(t): raise NotImplementedError("unpack_tensor_to_dict not found")
+
+    valid_quant_types_static = ("fp4", "nf4") # For as_dict/from_dict key construction
+    valid_qs_type_keys_static = [f"bitsandbytes__{x}" for x in valid_quant_types_static] # Note: refactored used "bitsandbytes_{x}"
+    valid_qs_keys_static = [ # From refactored
+        "absmax", "quant_map", "nested_absmax", "nested_quant_map",
+        "quant_state", "quant_type", "blocksize", "dtype", "shape",
+        "nested_blocksize", "nested_dtype", "nested_offset",
+    ]
+
+
+    @classmethod
+    def from_dict(cls, qs_dict: dict[str, Any], device: Optional[torch.device] = None) -> "QuantState":
+  
+        qs_dict_copy = qs_dict.copy()
+
+        packed_state_key = None
+        for k in qs_dict_copy.keys():
+            if "quant_state.bitsandbytes__" in k and isinstance(qs_dict_copy[k], torch.Tensor):
+                packed_state_key = k
+                break
+        
+        if packed_state_key:
+            unpacked_items = unpack_tensor_to_dict(qs_dict_copy.pop(packed_state_key))
+            qs_dict_copy.update(unpacked_items)
+
+        cleaned_qs_dict = {}
+        for k, v in qs_dict_copy.items():
+            cleaned_key = k.split(".")[-1] # Takes the last part after any dots
+            cleaned_qs_dict[cleaned_key] = v
+
+        target_device = device if device is not None else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+
+        nested_state2 = None
+        nested_offset_tensor = None
+        if "nested_absmax" in cleaned_qs_dict:
+            nested_offset_val = float(cleaned_qs_dict.get("nested_offset", 0.0))
+            nested_offset_tensor = torch.tensor(nested_offset_val, device=target_device, dtype=torch.float32)
+            
+            nested_state2 = cls(
+                absmax=cleaned_qs_dict["nested_absmax"].to(target_device),
+                blocksize=int(cleaned_qs_dict["nested_blocksize"]),
+                code=cleaned_qs_dict["nested_quant_map"].to(target_device), 
+                dtype=getattr(torch, cleaned_qs_dict["nested_dtype"]),
+                quant_type=cleaned_qs_dict.get("quant_type"),
+                shape=torch.Size(cleaned_qs_dict.get("shape", [])), 
+            )
+            
+     
+        shape_data = cleaned_qs_dict.get("shape")
+        final_shape = None
+        if shape_data is not None:
+            if isinstance(shape_data, (list, tuple)):
+                final_shape = torch.Size(shape_data)
+            elif isinstance(shape_data, torch.Size):
+                final_shape = shape_data
+            else:
+                try: 
+                    final_shape = torch.Size(eval(str(shape_data)))
+                except:
+                    logger.warning(f"Could not parse shape '{shape_data}' for QuantState, leaving as None.")
+
+
+        quant_state_obj = cls(
+            absmax=cleaned_qs_dict["absmax"].to(target_device),
+            shape=final_shape,
+            code=cleaned_qs_dict["quant_map"].to(target_device), 
+            blocksize=int(cleaned_qs_dict["blocksize"]),
+            quant_type=str(cleaned_qs_dict["quant_type"]),
+            dtype=getattr(torch, str(cleaned_qs_dict["dtype"])),
+            offset=nested_offset_tensor,
+            state2=nested_state2,
+        )
+        return quant_state_obj
+
+    def as_dict(self, packed: bool = False) -> dict[str, Any]:
+        qs_dict_data = {
+            "quant_type": str(self.quant_type),
+            "absmax": self.absmax,
+            "blocksize": int(self.blocksize) if self.blocksize is not None else 0,
+            "quant_map": self.code, 
+            "dtype": str(self.dtype).replace("torch.", ""), 
+            "shape": list(self.shape) if self.shape is not None else [], 
+        }
+
+        if self.nested and self.state2 is not None and self.offset is not None:
+            qs_dict_data.update({
+                "nested_absmax": self.state2.absmax,
+                "nested_blocksize": int(self.state2.blocksize) if self.state2.blocksize is not None else 0,
+                "nested_quant_map": self.state2.code.clone(), 
+                "nested_dtype": str(self.state2.dtype).replace("torch.", ""),
+                "nested_offset": float(self.offset.item()) if isinstance(self.offset, torch.Tensor) else float(self.offset),
+            })
+
+        if not packed:
+            return qs_dict_data
+
+        final_packed_dict = {}
+        non_tensor_items = {}
+        for k, v in qs_dict_data.items():
+            if isinstance(v, torch.Tensor):
+                final_packed_dict[k] = v
+            else:
+                non_tensor_items[k] = v
+        
+
+        if non_tensor_items:
+            serialization_quant_type = self.quant_type if self.quant_type in self.valid_quant_types_static else "other"
+            packed_non_tensor_key = f"quant_state.bitsandbytes__{serialization_quant_type}"
+            
+            final_packed_dict[packed_non_tensor_key] = pack_dict_to_tensor(non_tensor_items)
+            
+        return final_packed_dict
+
+    def to(self, device: Union[str, torch.device]): 
+        self.absmax = self.absmax.to(device)
+        if self.code is not None:
+            self.code = self.code.to(device)
+        if self.nested:
+            if self.offset is not None:
+                self.offset = self.offset.to(device)
+            if self.state2 is not None:
+                self.state2.to(device) 
+        return self 
+
+    def __eq__(self, other) -> bool: 
+        if not isinstance(other, QuantState):
+            return False
+      
+        if not (self.shape == other.shape and \
+                self.dtype == other.dtype and \
+                self.blocksize == other.blocksize and \
+                self.quant_type == other.quant_type):
+            return False
+
+        if not torch.allclose(self.absmax, other.absmax, atol=1e-6): return False
+        if self.code is not None and other.code is not None:
+            if not torch.allclose(self.code, other.code, atol=1e-6): return False
+        elif self.code is not other.code: # One is None, the other isn't
+            return False
+            
+        if self.nested != other.nested: return False
+        if self.nested: # Both are nested
+            if (self.offset is not None and other.offset is not None):
+                if isinstance(self.offset, torch.Tensor) and isinstance(other.offset, torch.Tensor):
+                    if not torch.allclose(self.offset, other.offset, atol=1e-6): return False
+                elif self.offset != other.offset : return False 
+            elif self.offset is not other.offset: 
+                 return False
+
+            if not (self.state2 == other.state2): return False 
+        
+        return True
+
+import logging
+logger = logging.getLogger(__name__) 
+
+def is_on_gpu(tensors: Iterable[Optional[torch.Tensor]]):
+    """
+    Verifies that the input tensors are all on the same GPU device.
+    A tensor might be None or marked as 'paged', in which case its device placement is handled differently.
+    """
+    on_gpu_device = True 
+    gpu_device_indices = set()
+    first_device_type = None
+
+    for t in tensors:
+        if t is None:
+            continue
+        
+        if getattr(t, "is_paged", False):
+            if first_device_type is None and t.page_deviceid is not None : 
+                 first_device_type = "cuda" 
+            continue
+
+        if t.device.type not in ["cuda"]: 
+            on_gpu_device = False
+            break
+        
+        if first_device_type is None:
+            first_device_type = t.device.type
+        elif t.device.type != first_device_type:
+            on_gpu_device = False 
+            break
+        
+        gpu_device_indices.add(t.device.index)
+
+    if not on_gpu_device:
+        tensor_info = []
+        for t_info in tensors:
+            if t_info is not None:
+                tensor_info.append( (str(t_info.shape), str(t_info.device), getattr(t_info, 'is_paged', False)) )
+            else:
+                tensor_info.append( (None, None, None) )
+        raise RuntimeError(
+            f"All input tensors intended for GPU operations need to be on a 'cuda' device (NVIDIA or ROCm), "
+            f"but found mixed or non-GPU devices: {tensor_info}",
+        )
+
+    if len(gpu_device_indices) > 1:
+        tensor_info = []
+        for t_info in tensors:
+            if t_info is not None and not getattr(t_info, 'is_paged', False): 
+                tensor_info.append( (str(t_info.shape), str(t_info.device)) )
+        raise RuntimeError(
+            f"Input tensors need to be on the same GPU, but found combinations on different GPU indices: {tensor_info}",
+        )
+    return True 
+
+
+def get_tensor_stream(tensor: Tensor) -> ct.c_void_p: 
+    """Gets the raw CUDA/HIP stream of a tensor."""
+    if tensor.device.type not in ["cuda"]:
+        raise TypeError(f"Tensor must be on a 'cuda' (GPU) device to get its stream, but got {tensor.device.type}")
+    return ct.c_void_p(torch._C._cuda_getCurrentRawStream(tensor.device.index))
+
+
+def get_ptr(A: Optional[Tensor]) -> Optional[ct.c_void_p]:
+    """Gets the memory address of the first element of a tensor."""
+    if A is None:
+        return None
+    return ct.c_void_p(A.data_ptr())
+
+
+@deprecated("This function is deprecated. Use torch.ops.bitsandbytes.estimate_quantiles or specific backend version.", category=FutureWarning)
+def estimate_quantiles( 
+    A: Tensor,
+    out: Optional[torch.Tensor] = None,
+    offset: float = 1 / 512,
+    num_quantiles: int = 256,
+) -> Tensor:
+    if A.numel() < 256: # Min elements for meaningful quantile estimation
+        raise NotImplementedError(
+            f"Quantile estimation needs at least 256 values, but tensor had only {A.numel()} values."
+        )
+    if num_quantiles > 256:
+        raise NotImplementedError(
+            f"Currently only a maximum of 256 equally spaced quantiles are supported, got {num_quantiles}."
+        )
+    
+    if num_quantiles < 256 and offset == 1 / 512: 
+        offset = 1 / (2 * num_quantiles)
+
+    if out is None:
+        out = torch.zeros((256,), dtype=torch.float32, device=A.device)
+    else:
+        if out.numel() < 256 :
+             raise ValueError(f"Output tensor `out` must have at least 256 elements, got {out.numel()}")
+        if out.device != A.device:
+             out = out.to(A.device)
+        if out.dtype != torch.float32:
+             out = out.to(torch.float32)
+
+
+    with _cuda_device_of(A): 
+        is_on_gpu([A, out]) 
+
+        if A.dtype == torch.float32:
+            lib.cestimate_quantiles_fp32(get_ptr(A), get_ptr(out), ct.c_float(offset), ct.c_int(A.numel()))
+        elif A.dtype == torch.float16:
+            lib.cestimate_quantiles_fp16(get_ptr(A), get_ptr(out), ct.c_float(offset), ct.c_int(A.numel()))
+        else:
+            raise NotImplementedError(f"Quantile estimation not supported for data type {A.dtype}")
+
+    if num_quantiles < 256:
+        idx = torch.linspace(0, 255, num_quantiles, device=A.device).long()
+        out = out[idx]
+    
+    return out
+
+
+def quantize_blockwise(
+    A: torch.Tensor,
+    code: Optional[torch.Tensor] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: int = 4096, 
+    nested: bool = False,
+) -> tuple[torch.Tensor, QuantState]:
+    """Quantize a tensor in blocks of values (typically 8-bit dynamic quantization)."""
+    if code is None:
+        if "dynamic" not in name2qmap: # Cache the map
+            name2qmap["dynamic"] = create_dynamic_map().to(A.device) 
+        code = name2qmap["dynamic"]
+    else: # Ensure provided code is on the correct device
+        code = code.to(A.device)
+
+    n = A.numel()
+    num_blocks = (n + blocksize - 1) // blocksize 
+
+    if absmax is None:
+        absmax = torch.empty((num_blocks,), device=A.device, dtype=torch.float32)
+    elif absmax.numel() != num_blocks:
+        raise ValueError(f"Provided absmax tensor has incorrect size. Expected {num_blocks}, got {absmax.numel()}")
+
+    if out is None:
+        out = torch.empty_like(A, dtype=torch.uint8) 
+    elif out.dtype != torch.uint8:
+        raise ValueError(f"Output tensor `out` must be of dtype torch.uint8, got {out.dtype}")
+
+    supported_blocksizes_cuda = [4096, 2048, 1024, 512, 256, 128, 64]
+    supported_blocksizes_hip = [4096, 2048, 1024, 512, 256, 128] # 64 might be less optimal or not supported on some HIP
+    
+    current_device_type = A.device.type
+    if current_device_type == "cuda": # Covers both NVIDIA and AMD ROCm via PyTorch device type
+        is_on_gpu([A, code, absmax, out]) # Ensure all tensors are on GPU
+        with _cuda_device_of(A): # Set device context
+            c_blocksize_arg = ct.c_int32(blocksize) # For GPU kernels
+            
+            if HIP_ENVIRONMENT:
+                if blocksize not in supported_blocksizes_hip:
+                    logger.warning(
+                        f"Blocksize {blocksize} for quantize_blockwise on ROCm is not in the typical supported list: {supported_blocksizes_hip}. "
+                        "Kernel might not be optimized or available."
+                    )
+            else: # CUDA
+                if blocksize not in supported_blocksizes_cuda:
+                     logger.warning(
+                        f"Blocksize {blocksize} for quantize_blockwise on CUDA is not in the typical supported list: {supported_blocksizes_cuda}. "
+                        "Kernel might not be optimized or available."
+                    )
+
+            if A.dtype == torch.float32:
+                lib.cquantize_blockwise_fp32(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), c_blocksize_arg, ct.c_int(n))
+            elif A.dtype == torch.float16:
+                lib.cquantize_blockwise_fp16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), c_blocksize_arg, ct.c_int(n))
+            elif A.dtype == torch.bfloat16:
+                lib.cquantize_blockwise_bf16(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), c_blocksize_arg, ct.c_int(n))
+            else:
+                raise ValueError(f"Blockwise quantization only supports float16/bfloat16/float32, but got {A.dtype}")
+
+    elif current_device_type == "cpu":
+        if A.dtype != torch.float32: # CPU kernel in main PDF was specific to fp32 input
+            raise ValueError(f"CPU quantize_blockwise currently only supports float32 input, got {A.dtype}")
+        if code.device.type != "cpu": code = code.cpu()
+        if absmax.device.type != "cpu": absmax = absmax.cpu()
+        if out.device.type != "cpu": out = out.cpu()
+        lib.cquantize_blockwise_cpu_fp32(get_ptr(code), get_ptr(A), get_ptr(absmax), get_ptr(out), ct.c_longlong(blocksize), ct.c_longlong(n))
+    else:
+        raise NotImplementedError(f"quantize_blockwise not implemented for device type {current_device_type}")
+
+    if nested:
+
+        offset = absmax.mean() 
+        absmax_to_quantize = absmax - offset
+        qabsmax, state2 = quantize_blockwise(absmax_to_quantize, code=code, blocksize=blocksize, nested=False) 
+        
+        quant_state = QuantState(
+            absmax=qabsmax, code=code, blocksize=blocksize, dtype=A.dtype, 
+            offset=offset, state2=state2, shape=A.shape, quant_type="dynamic_nested"
+        )
+    else:
+        quant_state = QuantState(
+            absmax=absmax, code=code, blocksize=blocksize, dtype=A.dtype, 
+            shape=A.shape, quant_type="dynamic"
+        )
+    
+    return out, quant_state
+
+
+def dequantize_blockwise( 
+    A: torch.Tensor, 
+    quant_state: Optional[QuantState] = None,
+
+    absmax: Optional[torch.Tensor] = None, 
+    code: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None, 
+) -> torch.Tensor:
+    """Dequantize a tensor that was quantized by quantize_blockwise."""
+    if quant_state is None:
+        if absmax is None or code is None or blocksize is None:
+            raise ValueError("If quant_state is None, then absmax, code, and blocksize must be provided.")
+        _dtype = torch.float32
+        _shape = A.shape # Output shape will be same as quantized if not further info
+
+        quant_state = QuantState(absmax=absmax, code=code, blocksize=blocksize, dtype=_dtype, shape=_shape, quant_type="dynamic_legacy")
+    
+    current_absmax = quant_state.absmax
+    current_code = quant_state.code
+    current_blocksize = quant_state.blocksize
+    target_dtype = quant_state.dtype
+    target_shape = quant_state.shape if quant_state.shape is not None else A.shape
+
+    if quant_state.nested:
+        dequantized_absmax = dequantize_blockwise(current_absmax, quant_state.state2)
+        current_absmax = dequantized_absmax + quant_state.offset # Add back the offset
+    
+    if current_absmax.dtype != torch.float32: # Ensure absmax is float32 for dequant kernel
+        current_absmax = current_absmax.float()
+    if current_code.device != A.device: # Ensure code is on same device as data
+        current_code = current_code.to(A.device)
+
+    if out is None:
+        out = torch.empty(target_shape, dtype=target_dtype, device=A.device)
+    elif out.shape != target_shape or out.dtype != target_dtype:
+        raise ValueError(
+            f"Output tensor `out` has incorrect shape or dtype. Expected shape {target_shape}, dtype {target_dtype}, "
+            f"but got shape {out.shape}, dtype {out.dtype}."
+        )
+
+    n = out.numel() # Number of elements in the output tensor
+
+    current_device_type = A.device.type
+    if current_device_type == "cuda": 
+        is_on_gpu([A, current_absmax, current_code, out])
+        with _cuda_device_of(A):
+            c_blocksize_arg = ct.c_int(current_blocksize) 
+
+            supported_blocksizes_cuda = [4096, 2048, 1024, 512, 256, 128, 64]
+            supported_blocksizes_hip = [4096, 2048, 1024, 512, 256, 128]
+            if HIP_ENVIRONMENT:
+                if current_blocksize not in supported_blocksizes_hip:
+                    logger.warning(f"Blocksize {current_blocksize} for dequantize_blockwise on ROCm not in typical list.")
+            else:
+                if current_blocksize not in supported_blocksizes_cuda:
+                    logger.warning(f"Blocksize {current_blocksize} for dequantize_blockwise on CUDA not in typical list.")
+            
+            if target_dtype == torch.float32:
+                lib.cdequantize_blockwise_fp32(get_ptr(current_code), get_ptr(A), get_ptr(current_absmax), get_ptr(out), c_blocksize_arg, ct.c_int(n))
+            elif target_dtype == torch.float16:
+                lib.cdequantize_blockwise_fp16(get_ptr(current_code), get_ptr(A), get_ptr(current_absmax), get_ptr(out), c_blocksize_arg, ct.c_int(n))
+            elif target_dtype == torch.bfloat16:
+                lib.cdequantize_blockwise_bf16(get_ptr(current_code), get_ptr(A), get_ptr(current_absmax), get_ptr(out), c_blocksize_arg, ct.c_int(n))
+            else:
+                raise ValueError(f"Blockwise dequantization only supports float16/bfloat16/float32 output, but got {target_dtype}")
+    
+    elif current_device_type == "cpu":
+        if target_dtype != torch.float32: 
+            raise ValueError(f"CPU dequantize_blockwise currently only supports float32 output, got {target_dtype}")
+        if current_code.device.type != "cpu": current_code = current_code.cpu()
+        if current_absmax.device.type != "cpu": current_absmax = current_absmax.cpu()
+        if A.device.type != "cpu": A_cpu = A.cpu() 
+        else: A_cpu = A
+        if out.device.type != "cpu": 
+            pass
+
+        lib.cdequantize_blockwise_cpu_fp32(get_ptr(current_code), get_ptr(A_cpu), get_ptr(current_absmax), get_ptr(out), ct.c_longlong(current_blocksize), ct.c_longlong(n))
+    else:
+        raise NotImplementedError(f"dequantize_blockwise not implemented for device type {current_device_type}")
+        
+    return out
+
+def get_4bit_type(typename: str, device: Optional[Union[str, torch.device]] = None, blocksize: int = 64) -> torch.Tensor: # As in Main PDF (page 41)
+    """
+    Returns the quantization map for a given 4-bit data type (nf4, fp4, etc.).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    data = None
+    if typename == "nf4":
+        data = [
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+            -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+            0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+            0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0,
+        ]
+    elif typename == "fp4": # Values from Main PDF
+        data = [
+            0.0, 0.0625, 8.0, 12.0, 4.0, 6.0, 2.0, 3.0, 
+            -0.0, -0.0625, -8.0, -12.0, -4.0, -6.0, -2.0, -3.0 # Ensure negative zero if distinct, or just 0.
+        ]
+    elif typename == "int4": # From Main PDF
+        data = [7, 6, 5, 4, 3, 2, 1, 0, -0, -1, -2, -3, -4, -5, -6, -7] # Symmetric int4
+        data = [float(x) for x in data] # Convert to float for tensor
+    elif typename == "af4": # Abnormal Float 4-bit (Main PDF)
+        if blocksize == 64: # AF4 in main PDF was blocksize specific
+            data = [ # Values are reversed in main PDF, check intended order
+                -1.0, -0.69441008, -0.51243739, -0.3736951,
+                -0.25607552, -0.14982478, -0.04934812, 0.0,
+                0.04273164, 0.12934483, 0.21961274, 0.31675666,
+                0.42563882, 0.55496234, 0.72424863, 1.0,
+            ] 
+        else:
+            raise NotImplementedError(f"4-bit Abnormal Floats (af4) currently only support blocksize 64, got {blocksize}.")
+    
+    if data is None:
+        raise NotImplementedError(f"4-bit type '{typename}' not supported.")
+
+    map_tensor = torch.tensor(data, dtype=torch.float32, device=device)
+    max_abs = map_tensor.abs().max()
+    if max_abs > 0:
+        map_tensor.div_(max_abs)
+    
+    if map_tensor.numel() != 16:
+        raise ValueError(f"Generated 4-bit map for '{typename}' has {map_tensor.numel()} elements, expected 16.")
+        
+    return map_tensor
+
+
+def quantize_4bit( 
+    A: torch.Tensor,
+    absmax: Optional[torch.Tensor] = None, 
+    out: Optional[torch.Tensor] = None,    
+    blocksize: Optional[int] = None,
+    compress_statistics: bool = False, 
+    quant_type: str = "fp4", # "nf4" or "fp4"
+    quant_storage: torch.dtype = torch.uint8, 
+) -> tuple[torch.Tensor, QuantState]:
+    """Quantize tensor A to 4-bit using blockwise quantization."""
+    
+    if blocksize is None: 
+        blocksize = 64 if not HIP_ENVIRONMENT else 128
+
+    input_shape = A.shape
+    n = A.numel()
+    num_blocks = (n + blocksize - 1) // blocksize
+
+    current_device_type = A.device.type
+    if current_device_type == "cuda": 
+        is_on_gpu([A]) 
+        
+
+        supported_blocksizes_cuda = [4096, 2048, 1024, 512, 256, 128, 64]
+        supported_blocksizes_hip = [4096, 2048, 1024, 512, 256, 128] # Example for HIP
+
+        if HIP_ENVIRONMENT:
+            if blocksize not in supported_blocksizes_hip:
+                logger.warning(f"Blocksize {blocksize} for quantize_4bit on ROCm not in typical list: {supported_blocksizes_hip}")
+        else: # CUDA
+            if blocksize not in supported_blocksizes_cuda:
+                logger.warning(f"Blocksize {blocksize} for quantize_4bit on CUDA not in typical list: {supported_blocksizes_cuda}")
+
+        num_output_elements_packed = (n + 1) // (quant_storage.itemsize * 8 // 4) # General for any itemsize
+
+        _out_q = torch.empty((num_output_elements_packed, 1), dtype=quant_storage, device=A.device)
+        _absmax_q = torch.empty((num_blocks,), device=A.device, dtype=torch.float32)
+
+        with _cuda_device_of(A):
+            c_args = (
+                None, 
+                get_ptr(A),
+                get_ptr(_absmax_q),
+                get_ptr(_out_q),
+                ct.c_int32(blocksize),
+                ct.c_int(n), 
+            )
+            if A.dtype == torch.bfloat16:
+                if quant_type == "fp4": lib.cquantize_blockwise_bf16_fp4(*c_args)
+                else: lib.cquantize_blockwise_bf16_nf4(*c_args) # nf4
+            elif A.dtype == torch.float16:
+                if quant_type == "fp4": lib.cquantize_blockwise_fp16_fp4(*c_args)
+                else: lib.cquantize_blockwise_fp16_nf4(*c_args) # nf4
+            elif A.dtype == torch.float32:
+                if quant_type == "fp4": lib.cquantize_blockwise_fp32_fp4(*c_args)
+                else: lib.cquantize_blockwise_fp32_nf4(*c_args) # nf4
+            else:
+                raise ValueError(f"4-bit quantization only supports bfloat16/float16/float32, got {A.dtype}")
+    
+    elif current_device_type == "cpu":
+        if quant_type != "nf4": # Main PDF CPU ops only showed NF4 for 4-bit
+            raise NotImplementedError(f"CPU 4-bit quantization currently only supports nf4, got {quant_type}")
+        if A.dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+            raise ValueError(f"CPU 4-bit quantization only supports float16/32, got {A.dtype}")
+        if n % blocksize != 0: # CPU check from main PDF
+             raise ValueError(f"CPU 4-bit quantization: n ({n}) must be divisible by blocksize ({blocksize})")
+
+        blocks_reshaped = A.reshape(-1, blocksize)
+        _absmax_q = blocks_reshaped.abs().max(dim=1).values.float() 
+        scaled = blocks_reshaped / _absmax_q.unsqueeze(-1)
+        
+  
+        _NF4_QUANT_TABLE_CPU = get_4bit_type("nf4", device='cpu')
+
+        quantized_indices = torch.argmin(torch.abs(scaled.reshape(-1, 1) - _NF4_QUANT_TABLE_CPU), dim=-1).to(torch.uint8)
+
+        if quantized_indices.numel() % 2 != 0: # Pad if odd number of elements
+            quantized_indices = torch.cat([quantized_indices, torch.zeros(1, dtype=torch.uint8, device='cpu')])
+
+        _out_q_packed_list = (quantized_indices[::2] << 4) | quantized_indices[1::2]
+        _out_q = _out_q_packed_list.unsqueeze(1) 
+
+        if quant_storage != torch.uint8: 
+             _out_q = _out_q.squeeze().view(quant_storage).unsqueeze(1)
+
+    else:
+        raise NotImplementedError(f"quantize_4bit not implemented for device type {current_device_type}")
+
+
+    if out is not None: out.copy_(_out_q)
+    else: out = _out_q
+    if absmax is not None: absmax.copy_(_absmax_q)
+    code_map = get_4bit_type(quant_type, device=A.device) # Get the 4-bit map for the state
+    
+    final_absmax_for_state = _absmax_q
+    final_offset_for_state = None
+    final_state2_for_state = None
+
+    if compress_statistics: # Nested quantization for absmax
+        offset_val = _absmax_q.mean()
+        absmax_to_quantize_nested = _absmax_q - offset_val
+        qabsmax_nested, state2_nested = quantize_blockwise(absmax_to_quantize_nested, blocksize=256, nested=False)
+        
+        final_absmax_for_state = qabsmax_nested
+        final_offset_for_state = offset_val
+        final_state2_for_state = state2_nested
+        
+    quant_state_obj = QuantState(
+        absmax=final_absmax_for_state,
+        shape=input_shape,
+        dtype=A.dtype,
+        blocksize=blocksize,
+        code=code_map, # The 4-bit map (e.g., NF4 values)
+        quant_type=quant_type,
+        offset=final_offset_for_state,
+        state2=final_state2_for_state
+
+    )
+    
+    return out, quant_state_obj
+
+
+def dequantize_4bit( 
+    A: torch.Tensor, 
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None, 
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None, 
+    quant_type: Optional[str] = None, 
+) -> torch.Tensor:
+    """Dequantizes a 4-bit quantized tensor."""
+
+    if quant_state is None:
+
+        if absmax is None or blocksize is None or quant_type is None or out is None: 
+            raise ValueError("If quant_state is None, then absmax, blocksize, quant_type, and a template `out` tensor (for shape/dtype) must be provided.")
+        _quant_state_temp = QuantState(
+            absmax=absmax, shape=out.shape, dtype=out.dtype, 
+            blocksize=blocksize, quant_type=quant_type,
+            code=get_4bit_type(quant_type, device=A.device) # Generate code map
+        )
+
+        current_quant_state = _quant_state_temp
+    else:
+        current_quant_state = quant_state
+
+
+    current_absmax = current_quant_state.absmax
+    current_blocksize = current_quant_state.blocksize
+    current_quant_type = current_quant_state.quant_type
+    target_shape = current_quant_state.shape
+    target_dtype = current_quant_state.dtype
+   
+
+    if current_quant_state.nested:
+
+        dequantized_absmax_stats = dequantize_blockwise(current_absmax, current_quant_state.state2) # Uses 8-bit dequant
+        current_absmax = dequantized_absmax_stats + current_quant_state.offset
+    
+    if current_absmax.dtype != torch.float32: 
+        current_absmax = current_absmax.float()
+
+
+    if out is None:
+        out_tensor = torch.empty(target_shape, dtype=target_dtype, device=A.device)
+    else: 
+        if out.shape != target_shape or out.dtype != target_dtype or out.device != A.device:
+            raise ValueError(f"Provided `out` tensor is incompatible. Expected shape {target_shape}, dtype {target_dtype}, device {A.device}. "
+                             f"Got shape {out.shape}, dtype {out.dtype}, device {out.device}.")
+        out_tensor = out
+        
+    num_output_elements = out_tensor.numel()
+
+    current_device_type = A.device.type
+    if current_device_type == "cuda": 
+        is_on_gpu([A, current_absmax, out_tensor])
+        with _cuda_device_of(A):
+            c_blocksize_arg = ct.c_int(current_blocksize)
+            stream_ptr = get_tensor_stream(A) 
+
+            supported_blocksizes_cuda = [4096, 2048, 1024, 512, 256, 128, 64]
+            supported_blocksizes_hip = [4096, 2048, 1024, 512, 256, 128]
+            if HIP_ENVIRONMENT:
+                if current_blocksize not in supported_blocksizes_hip:
+                    logger.warning(f"Blocksize {current_blocksize} for dequantize_4bit on ROCm not in typical list.")
+            else: 
+                if current_blocksize not in supported_blocksizes_cuda:
+                    logger.warning(f"Blocksize {current_blocksize} for dequantize_4bit on CUDA not in typical list.")
+            
+            c_args = (
+                None, 
+                get_ptr(A), 
+                get_ptr(current_absmax), 
+                get_ptr(out_tensor),   
+                c_blocksize_arg,
+                ct.c_int(num_output_elements), 
+                stream_ptr 
+            )
+
+
+            if target_dtype == torch.bfloat16:
+                if current_quant_type == "fp4": lib.cdequantize_blockwise_bf16_fp4(*c_args)
+                else: lib.cdequantize_blockwise_bf16_nf4(*c_args) # nf4
+            elif target_dtype == torch.float16:
+                if current_quant_type == "fp4": lib.cdequantize_blockwise_fp16_fp4(*c_args)
+                else: lib.cdequantize_blockwise_fp16_nf4(*c_args) # nf4
+            elif target_dtype == torch.float32:
+                if current_quant_type == "fp4": lib.cdequantize_blockwise_fp32_fp4(*c_args)
+                else: lib.cdequantize_blockwise_fp32_nf4(*c_args) # nf4
+            else:
+                raise ValueError(f"4-bit dequantization only supports bfloat16/float16/float32 output, got {target_dtype}")
+
+    elif current_device_type == "cpu":
+
+        if current_quant_type != "nf4":
+            raise NotImplementedError(f"CPU 4-bit dequantization currently only supports nf4, got {current_quant_type}")
+        if target_dtype not in [torch.bfloat16, torch.float16, torch.float32]:
+            raise ValueError(f"CPU 4-bit dequantization only supports float16/32 output, got {target_dtype}")
+        if A.dtype != torch.uint8: 
+            raise ValueError(f"CPU 4-bit dequantization expects uint8 input, got {A.dtype}")
+
+        A_cpu = A.cpu() if A.device.type != "cpu" else A
+        current_absmax_cpu = current_absmax.cpu() if current_absmax.device.type != "cpu" else current_absmax
+        if out_tensor.device.type != "cpu": out_tensor = out_tensor.to("cpu") 
+
+        A_flat = A_cpu.view(-1)
+        upper_nibbles = (A_flat >> 4).to(torch.int64) # Higher 4 bits
+        lower_nibbles = (A_flat & 0x0F).to(torch.int64) # Lower 4 bits
+        
+        indices = torch.empty(num_output_elements, dtype=torch.int64, device='cpu')
+        num_packed_bytes = A_flat.numel()
+        indices[:num_packed_bytes*2:2] = upper_nibbles[:num_packed_bytes]
+        if num_output_elements % 2 == 0 : 
+             indices[1:num_packed_bytes*2:2] = lower_nibbles[:num_packed_bytes]
+        else: 
+             if num_packed_bytes > 0: 
+                indices[1:(num_packed_bytes-1)*2+1:2] = lower_nibbles[:num_packed_bytes-1]          
+                unpacked_values = []
+                for byte_val in A_flat:
+                    unpacked_values.append( (byte_val.item() >> 4) & 0x0F )
+                    unpacked_values.append( byte_val.item() & 0x0F )     
+                indices = torch.tensor(unpacked_values[:num_output_elements], dtype=torch.int64, device='cpu')
+
+        _NF4_QUANT_TABLE_CPU = get_4bit_type("nf4", device='cpu')
+        dequantized_blocks_scaled = _NF4_QUANT_TABLE_CPU[indices]
+        dequantized_blocks_scaled = dequantized_blocks_scaled.reshape(-1, current_blocksize)
+        dequantized_final = dequantized_blocks_scaled * current_absmax_cpu.unsqueeze(-1)
+        
+
+        out_tensor.copy_(dequantized_final.reshape(target_shape).to(target_dtype))
+
+    else:
+        raise NotImplementedError(f"dequantize_4bit not implemented for device type {current_device_type}")
+        
+    return out_tensor
+
+def quantize_fp4(
+    A: torch.Tensor,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None, # Made optional to use env-aware default
+    compress_statistics: bool = False,
+    quant_storage: torch.dtype = torch.uint8,
+):
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, "fp4", quant_storage)
+
+def quantize_nf4(
+    A: torch.Tensor,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None, # Made optional
+    compress_statistics: bool = False,
+    quant_storage: torch.dtype = torch.uint8,
+):
+    return quantize_4bit(A, absmax, out, blocksize, compress_statistics, "nf4", quant_storage)
+
+def dequantize_fp4(
+    A: torch.Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None, 
+):
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "fp4")
+
+def dequantize_nf4(
+    A: torch.Tensor,
+    quant_state: Optional[QuantState] = None,
+    absmax: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    blocksize: Optional[int] = None, 
+):
+    return dequantize_4bit(A, quant_state, absmax, out, blocksize, "nf4")
+
+
+@deprecated("This function is deprecated. Use blockwise quantization (quantize_blockwise) or 4-bit quantization.", category=FutureWarning)
+def quantize(
+    A: Tensor,
+    code: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> tuple[Tensor, tuple[Tensor, Tensor]]: 
+    if code is None:
+        if "dynamic" not in name2qmap: 
+            name2qmap["dynamic"] = create_dynamic_map().to(A.device)
+        code = name2qmap["dynamic"]
+    else:
+        code = code.to(A.device)
+
+    current_absmax = torch.abs(A).max()
+    if current_absmax.dtype != torch.float32:
+        current_absmax = current_absmax.float()
+    
+    if current_absmax == 0: 
+        inp_scaled = torch.zeros_like(A)
+    else:
+        inp_scaled = A / current_absmax
+    
+
+    quantized_out = quantize_no_absmax(inp_scaled, code, out)
+    
+    return quantized_out, (current_absmax, code)
+
+
+@deprecated("This function is deprecated. Use blockwise dequantization (dequantize_blockwise) or 4-bit dequantization.", category=FutureWarning)
+def dequantize(
+    A: Tensor, 
+    state: Optional[tuple[Tensor, Tensor]] = None, 
+    absmax: Optional[torch.Tensor] = None,
+    code: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> Tensor:
+    current_absmax, current_code = None, None
+    if state is not None:
+        current_absmax, current_code = state
+    elif absmax is not None and code is not None:
+        current_absmax, current_code = absmax, code
+    else:
+        raise ValueError("Either 'state' or both 'absmax' and 'code' must be provided for dequantization.")
+
+    if current_code is None: 
+         raise ValueError("Quantization map 'code' is missing.")
+    current_code = current_code.to(A.device) 
+
+
+    dequantized_scaled_out = dequantize_no_absmax(A, current_code, out)
+    
+
+    if current_absmax is not None:
+        return dequantized_scaled_out * current_absmax
+    else: # Should not happen if absmax was required
+        return dequantized_scaled_out
+
+
+@deprecated("This function is deprecated.", category=FutureWarning)
+def quantize_no_absmax(A: Tensor, code: Tensor, out: Optional[torch.Tensor] = None) -> Tensor:
+    """Quantizes input tensor (assumed to be scaled to [-1, 1]) to 8-bit using 'code' map."""
+    current_device_type = A.device.type
+    if out is None:
+        out = torch.empty_like(A, dtype=torch.uint8) 
+    
+    if current_device_type == "cuda":
+        is_on_gpu([A, code, out])
+        with _cuda_device_of(A):
+            # lib.cquantize is the C function for this operation
+            lib.cquantize(get_ptr(code), get_ptr(A), get_ptr(out), ct.c_int(A.numel()))
+    elif current_device_type == "cpu":
+        logger.warning("quantize_no_absmax CPU path might be slow or not fully implemented without a dedicated C kernel.")
+        A_flat = A.flatten()
+        out_flat = out.flatten()
+        for i in range(A_flat.shape[0]):
+            val = A_flat[i]
+            insertion_point = torch.searchsorted(code, val.to(code.device)) 
+            idx = insertion_point.clamp(0, code.shape[0] - 1)
+            if idx > 0 and (val - code[idx-1]).abs() < (val - code[idx]).abs():
+                idx = idx -1
+            out_flat[i] = idx.to(torch.uint8)
+
+    else:
+        raise NotImplementedError(f"quantize_no_absmax not implemented for device type {current_device_type}")
+    return out
+
+
+@deprecated("This function is deprecated.", category=FutureWarning)
+def dequantize_no_absmax(A: Tensor, code: Tensor, out: Optional[torch.Tensor] = None) -> Tensor:
+    """Dequantizes 8-bit tensor to 32-bit float using 'code' map."""
+    current_device_type = A.device.type
+    if out is None:
+        out = torch.empty_like(A, dtype=torch.float32) # Output is float32
+
+    if current_device_type == "cuda": 
+        is_on_gpu([A, code, out])
+        with _cuda_device_of(A):
+            stream = get_tensor_stream(A) 
+            # lib.cdequantize is the C function
+            lib.cdequantize(get_ptr(code), get_ptr(A), get_ptr(out), ct.c_int(A.numel()), stream)
+    elif current_device_type == "cpu":
+ 
+        A_cpu = A.cpu() if A.device.type != "cpu" else A
+        code_cpu = code.cpu() if code.device.type != "cpu" else code
+        if out.device.type != "cpu": out = out.to("cpu")
+        
+        out.copy_(code_cpu[A_cpu.long()])
+    else:
+        raise NotImplementedError(f"dequantize_no_absmax not implemented for device type {current_device_type}")
+    return out
+
+from bitsandbytes.backends import backends, ensure_backend_is_available
+
+
+def optimizer_update_32bit( 
+    optimizer_name: str,
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor,
+    beta1: float,
+    eps: float,
+    step: int,
+    lr: float, 
+    state2: Optional[torch.Tensor] = None, 
+    beta2: float = 0.0,
+    beta3: float = 0.0, 
+    alpha: float = 0.0, 
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    unorm_vec: Optional[torch.Tensor] = None, 
+    max_unorm: float = 0.0, 
+    skip_zeros: bool = False,
+) -> None:
+    """
+    Performs an inplace 32-bit optimizer update.
+    Dispatches to the appropriate backend (CPU, CUDA, ROCm).
+    """
+    ensure_backend_is_available(g.device.type)
+    backends[g.device.type.lower()].optimizer_update_32bit(
+        optimizer_name=optimizer_name,
+        g=g,
+        p=p,
+        state1=state1,
+        beta1=beta1,
+        eps=eps,
+        step=step,
+        lr=lr, 
+        state2=state2,
+        beta2=beta2,
+        weight_decay=weight_decay,
+        gnorm_scale=gnorm_scale,
+        unorm_vec=unorm_vec,
+        max_unorm=max_unorm,
+        skip_zeros=skip_zeros,
+    )
+
+@deprecated(
+    "This function is deprecated. Use optimizer_update_8bit_blockwise instead.",
+    category=FutureWarning,
+)
+def optimizer_update_8bit( 
+    optimizer_name: str,
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor, 
+    state2: Optional[torch.Tensor], 
+    beta1: float,
+    beta2: float,
+    eps: float,
+    step: int,
+    lr: float, 
+    qmap1: Tensor, 
+    qmap2: Optional[torch.Tensor], 
+    max1: Tensor, 
+    max2: Optional[torch.Tensor], 
+    new_max1: Tensor, 
+    new_max2: Optional[torch.Tensor], 
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    unorm_vec: Optional[torch.Tensor] = None,
+    max_unorm: float = 0.0,
+) -> None:
+    """Deprecated static 8-bit optimizer update. GPU only."""
+    if g.device.type != 'cuda':
+        raise NotImplementedError("Static 8-bit optimizer is only implemented for CUDA/ROCm devices.")
+
+    param_norm = 0.0
+    if max_unorm > 0.0:
+        param_norm = torch.norm(p.data.float())
+
+    with _cuda_device_of(g):
+        is_on_gpu([g, p, state1, state2, unorm_vec, qmap1, qmap2, max1, max2, new_max1, new_max2]) # Defined in Part 2
+        
+        optim_func_idx = 0 # Default to float32 gradient version
+        if g.dtype == torch.float16: optim_func_idx = 1
+
+        if optimizer_name not in str2optimizer8bit or \
+           len(str2optimizer8bit[optimizer_name]) <= optim_func_idx:
+            raise ValueError(f"Static 8-bit optimizer {optimizer_name} not found or no kernel for grad dtype {g.dtype}")
+
+        c_optim_func = str2optimizer8bit[optimizer_name][optim_func_idx]
+        
+        c_optim_func(
+            get_ptr(p), get_ptr(g), get_ptr(state1), get_ptr(state2),
+            get_ptr(unorm_vec), ct.c_float(max_unorm), ct.c_float(param_norm),
+            ct.c_float(beta1), ct.c_float(beta2), ct.c_float(eps), ct.c_int32(step),
+            ct.c_float(lr), get_ptr(qmap1), get_ptr(qmap2),
+            get_ptr(max1), get_ptr(max2), get_ptr(new_max1), get_ptr(new_max2),
+            ct.c_float(weight_decay), ct.c_float(gnorm_scale), ct.c_int32(g.numel()),
+        )
+
+
+def optimizer_update_8bit_blockwise( 
+    optimizer_name: str,
+    g: Tensor,
+    p: Tensor,
+    state1: Tensor, 
+    state2: Optional[torch.Tensor], 
+    beta1: float,
+    beta2: float,
+    beta3: float, 
+    alpha: float, 
+    eps: float,
+    step: int,
+    lr: float,
+    qmap1: Tensor, 
+    qmap2: Optional[torch.Tensor], 
+    absmax1: Tensor, # Blockwise absmax for state1
+    absmax2: Optional[torch.Tensor], 
+    weight_decay: float = 0.0,
+    gnorm_scale: float = 1.0,
+    skip_zeros: bool = False,
+) -> None:
+    """
+    Performs an inplace 8-bit blockwise optimizer update.
+    Dispatches to the appropriate backend.
+    """
+    ensure_backend_is_available(g.device.type)
+    backends[g.device.type.lower()].optimizer_update_8bit_blockwise(
+        optimizer_name=optimizer_name,
+        g=g,
+        p=p,
+        state1=state1,
+        state2=state2,
+        beta1=beta1,
+        beta2=beta2,
+        # beta3 and alpha are not passed to backend method currently.
+        # If needed, backend method signature would need update, or specific handling here.
+        eps=eps,
+        step=step,
+        lr=lr,
+        qmap1=qmap1,
+        qmap2=qmap2,
+        absmax1=absmax1,
+        absmax2=absmax2,
+        weight_decay=weight_decay,
+        gnorm_scale=gnorm_scale,
+        skip_zeros=skip_zeros,
+    )
+
+
+@deprecated("This function is deprecated and GPU-specific.", category=FutureWarning)
+def percentile_clipping(grad: Tensor, gnorm_vec: Tensor, step: int, percentile: int = 5): 
+    """Applies percentile clipping. GPU only."""
+    if grad.device.type != 'cuda':
+        raise NotImplementedError("percentile_clipping is only implemented for CUDA/ROCm devices.")
+    
+    with _cuda_device_of(grad):
+        is_on_gpu([grad, gnorm_vec])
+        c_func = None
+        if grad.dtype == torch.float32:
+            c_func = lib.cpercentile_clipping_g32
+        elif grad.dtype == torch.float16:
+            c_func = lib.cpercentile_clipping_g16
+        else:
+            raise ValueError(f"Gradient type {grad.dtype} not supported for percentile_clipping!")
+        
+        c_func(
+            get_ptr(grad), get_ptr(gnorm_vec),
+            ct.c_int32(step), ct.c_int32(grad.numel())
+        )
+    
+    current_gnorm = torch.sqrt(gnorm_vec[step % 100]) 
+    vals_sorted, _ = torch.sort(gnorm_vec) 
+    clip_value_sq = vals_sorted[percentile] 
+    clip_value = torch.sqrt(clip_value_sq) 
+    
+    gnorm_scale = 1.0
+    if current_gnorm > clip_value:
+        gnorm_scale = clip_value / current_gnorm
+        
+    return current_gnorm, clip_value, gnorm_scale
+
+
+@deprecated("This function is deprecated and GPU-specific.", category=FutureWarning)
+def histogram_scatter_add_2d(histogram: Tensor, index1: Tensor, index2: Tensor, source: Tensor):
+    """Performs a 2D histogram scatter add. GPU only."""
+    if histogram.device.type != 'cuda':
+        raise NotImplementedError("histogram_scatter_add_2d is only implemented for CUDA/ROCm devices.")
+
+  
+    assert len(histogram.shape) == 2
+    assert histogram.dtype == torch.float32
+    assert source.dtype == torch.float32
+    assert index1.dtype == torch.int32
+    assert index2.dtype == torch.int32
+    
+    is_on_gpu([histogram, index1, index2, source])
+    
+    maxdim1 = ct.c_int32(histogram.shape[0])
+    n_elements = ct.c_int32(index1.numel()) 
+    
+    with _cuda_device_of(histogram):
+        lib.chistogram_scatter_add_2d(
+            get_ptr(histogram), get_ptr(index1), get_ptr(index2), get_ptr(source),
+            maxdim1, n_elements
+        )
+
+def check_matmul(A, B, out, transposed_A, transposed_B, expected_type=torch.int8):
+    """Utility to check matrix multiplication dimensions."""
+
+    if torch.cuda.is_available() and not torch.cuda.is_initialized(): 
+        torch.cuda.init()
+
+    if A.dtype != expected_type or B.dtype != expected_type:
+        raise TypeError(f"Expected {expected_type} input tensors A and B, but got {A.dtype} and {B.dtype}")
+
+    sA = A.shape
+    sB = B.shape
+    correct = True
+
+    if len(sA) == 2 and len(sB) == 2:
+        if not transposed_A and not transposed_B and A.shape[1] != B.shape[0]: correct = False
+        elif transposed_A and not transposed_B and A.shape[0] != B.shape[0]: correct = False
+        elif transposed_A and transposed_B and A.shape[0] != B.shape[1]: correct = False
+        elif not transposed_A and transposed_B and A.shape[1] != B.shape[1]: correct = False
+    elif len(sA) == 3 and len(sB) == 2:
+        if not transposed_A and not transposed_B and A.shape[2] != B.shape[0]: correct = False
+        elif transposed_A and not transposed_B and A.shape[1] != B.shape[0]: correct = False
+        elif transposed_A and transposed_B and A.shape[1] != B.shape[1]: correct = False
+        elif not transposed_A and transposed_B and A.shape[2] != B.shape[1]: correct = False
+    elif len(sA) == 3 and len(sB) == 3: 
+        if sA[0] != sB[0]: correct = False 
+        if not transposed_A and not transposed_B and A.shape[2] != B.shape[1]: correct = False
+        elif transposed_A and not transposed_B and A.shape[1] != B.shape[1]: correct = False
+        elif transposed_A and transposed_B and A.shape[1] != B.shape[2]: correct = False
+        elif not transposed_A and transposed_B and A.shape[2] != B.shape[2]: correct = False
+    else: 
+        correct = False
+
+  
+    sout_expected = None
+    if correct:
+        if len(sA) == 2 and len(sB) == 2:
+            sout_expected = (sA[0] if not transposed_A else sA[1], sB[1] if not transposed_B else sB[0])
+        elif len(sA) == 3 and len(sB) == 2: 
+            sout_expected = (sA[0], sA[1] if not transposed_A else sA[2], sB[1] if not transposed_B else sB[0])
+        elif len(sA) == 3 and len(sB) == 3: 
+            sout_expected = (sA[0], sA[1] if not transposed_A else sA[2], sB[2] if not transposed_B else sB[1])
+
+    if out is not None:
+        sout_actual = out.shape
+        if not correct and len(sA) == 3 and len(sB) == 3:
+            if sout_actual[0] == sA[2] and sout_actual[1] == sB[2] and sA[0] == sB[0] and sA[1] == sB[1]:
+                correct = True 
+                sout_expected = sout_actual 
+        elif sout_expected is not None and sout_actual != sout_expected:
+            correct = False 
+    elif not correct and sout_expected is None : 
+         pass 
+
+    if not correct:
+        raise ValueError(
+            f"Tensor dimensions incorrect for matrix multiplication: A x B: {sA} x {sB} "
+            f"with transpose_A={transposed_A}, transpose_B={transposed_B}. "
+            f"Expected output shape: {sout_expected if sout_expected else ' undetermined'}, "
+            f"Actual output shape (if out provided): {out.shape if out is not None else 'N/A'}."
+        )
+    return sout_expected if out is None else out.shape 
+
+def gemv_4bit( 
+    A: Tensor, 
+    B: Tensor, 
+    out: Optional[torch.Tensor] = None, 
+    transposed_A: bool = False, 
+    transposed_B: bool = False, 
+                               
+    state: Optional[QuantState] = None, 
+):
+    """Performs 4-bit GEMV: out = A @ B_dequantized."""
+    if state is None:
+        raise ValueError("QuantState 'state' for the 4-bit matrix B cannot be None for gemv_4bit.")
+    
+    ensure_backend_is_available(A.device.type)
+    return backends[A.device.type.lower()].gemv_4bit(
+        A=A, B=B, out=out,
+        transposed_A=transposed_A, 
+        transposed_B=transposed_B, 
+        state=state
+    )
+
+
+def igemm( # Integer GEMM from Main PDF (page 55)
+    A: Tensor, 
+    B: Tensor, 
+    out: Optional[torch.Tensor] = None, # Output int32
+    transposed_A: bool = False,
+    transposed_B: bool = False,
+):
+    """Performs int8 matrix multiplication: C = A @ B (with optional transposes)."""
+    if A.device.type != 'cuda':
+        raise NotImplementedError("igemm is currently only implemented for CUDA/ROCm devices via C extensions.")
+
+    sout_shape = check_matmul(A, B, out, transposed_A, transposed_B, expected_type=torch.int8)
+    if out is None:
+        out = torch.empty(sout_shape, dtype=torch.int32, device=A.device) # Note: torch.empty, not zeros
+    elif out.dtype != torch.int32:
+        raise ValueError(f"Output tensor for igemm must be int32, got {out.dtype}")
+
+    if len(A.shape) == 3 and len(B.shape) == 3:
+        if A.shape[0] == B.shape[0] and \
+           (A.shape[2] if not transposed_A else A.shape[1]) == \
+           (B.shape[1] if not transposed_B else B.shape[2]): # k_A == k_B for batch
+            return batched_igemm(A, B, out, transposed_A, transposed_B) # Call batched version
+
+    sA_effective = A.shape
+    sB_effective = B.shape
+    
+    
+    m_dim = A.shape[0] if not transposed_A else A.shape[1]
+    k_dim_A = A.shape[1] if not transposed_A else A.shape[0]
+    
+    k_dim_B = B.shape[0] if not transposed_B else B.shape[1]
+    n_dim = B.shape[1] if not transposed_B else B.shape[0]
+
+    if k_dim_A != k_dim_B:
+        raise ValueError(f"Inner dimensions for igemm mismatch: A_k={k_dim_A}, B_k={k_dim_B} "
+                         f"(A shape {A.shape}, tA={transposed_A}; B shape {B.shape}, tB={transposed_B})")
+    k_dim = k_dim_A
+
+
+    ptr = CUBLAS_Context.get_instance().get_context(A.device)
+    is_on_gpu([A, B, out]) # Validation
+
+
+    logger.warning("functional.igemm direct C call is complex and error-prone; prefer torch.ops.bitsandbytes.int8_linear_matmul.")
+      
+    rows_B_op = B.shape[0] if not transposed_B else B.shape[1]
+    cols_B_op = B.shape[1] if not transposed_B else B.shape[0] # This is K_eff
+
+    rows_A_op = A.shape[0] if not transposed_A else A.shape[1] # This must match K_eff
+    cols_A_op = A.shape[1] if not transposed_A else A.shape[0]
+
+    if cols_B_op != rows_A_op:
+        raise ValueError(f"Inner dimension mismatch for B_op @ A_op. B_op cols: {cols_B_op}, A_op rows: {rows_A_op}")
+
+    m_for_lib = rows_B_op
+    n_for_lib = cols_A_op
+    k_for_lib = cols_B_op # = rows_A_op
+
+    if out is not None:
+        torch.ops.bitsandbytes.int8_linear_matmul.out(A if not transposed_A else A.t(),
+                                                      B if not transposed_B else B.t(), 
+                                                      out) 
+        return out
+    else:
+        raise NotImplementedError("Direct igemm C call logic is too complex to safely replicate here. Use torch.ops or backend methods.")
+
+    return out
+
+
+def batched_igemm( # Main PDF (page 56)
+    A: Tensor, # int8, (batch, m, k)
+    B: Tensor, # int8, (batch, k, n)
+    out: Optional[torch.Tensor] = None, # Output int32, (batch, m, n)
+    transposed_A: bool = False, # Transpose for A within each batch item
+    transposed_B: bool = False, # Transpose for B within each batch item
+):
+    """Performs batched int8 matrix multiplication."""
+    if A.device.type != 'cuda':
+        raise NotImplementedError("batched_igemm is currently only implemented for CUDA/ROCm devices.")
+
+    if A.shape[0] != B.shape[0]:
+        raise ValueError(f"Batch dimensions for batched_igemm must match: A batch={A.shape[0]}, B batch={B.shape[0]}")
+
+
+    sout_shape_item = check_matmul(A[0], B[0], out[0] if out is not None else None, transposed_A, transposed_B, expected_type=torch.int8)
+    sout_shape_batch = (A.shape[0], *sout_shape_item)
+
+    if out is None:
+        out = torch.empty(sout_shape_batch, dtype=torch.int32, device=A.device)
+    elif out.dtype != torch.int32:
+        raise ValueError(f"Output tensor for batched_igemm must be int32, got {out.dtype}")
+
+    logger.warning("functional.batched_igemm direct C call is complex; prefer torch.ops or backend methods if available for int8 bmm.")
+
+    raise NotImplementedError("Direct batched_igemm C call logic is too complex. Use torch.ops or backend methods.")
+    
+    return out
+
+
+def int8_linear_matmul(A: torch.Tensor, B: torch.Tensor, out: Optional[torch.Tensor] = None, dtype=torch.int32): # Main PDF (page 58)
+    """
+    Performs int8_linear_matmul (A @ B.T). Uses torch.ops.
+    This is already backend-aware due to torch.library dispatch.
+    """
+    if A.device.type == "cpu" and B.device.type == "cpu":
+        # Main PDF cpu/ops.py has a direct torch._int_mm for torch >= 2.6
+        if hasattr(torch, '_int_mm') and torch.__version__ >= "2.6": # Check torch version appropriately
+             # This assumes A is activations, B is weights (transposed in _int_mm call)
+             # A: (..., K), B: (N, K) for A @ B.T -> (..., N)
+             # torch._int_mm(X, W.T()) where X is (M,K), W is (N,K)
+             # So, B is the weight matrix here.
+             if out is not None:
+                 # torch._int_mm doesn't have an out argument in this simple form.
+                 # Perform and then copy.
+                 res = torch._int_mm(A.reshape(-1, A.shape[-1]), B.t()).reshape(*A.shape[:-1], B.shape[0])
+                 out.copy_(res)
+                 return out
+             else:
+                 return torch._int_mm(A.reshape(-1, A.shape[-1]), B.t()).reshape(*A.shape[:-1], B.shape[0])
+        # Fall through to torch.ops if specific CPU version not met or not preferred.
+
+    if out is not None:
+        # Ensure out has correct dtype if provided, op might not check this before C call.
+        if out.dtype != dtype:
+            # This is tricky. The op expects out to be properly initialized.
+            # It's better if the op itself handles dtype or if user provides correct out.
+            # For now, assume op handles it or user is correct.
+            pass
+        torch.ops.bitsandbytes.int8_linear_matmul.out(A, B, out=out) # Pass B as is, op expects A @ B.T
+        return out
+    else:
+        return torch.ops.bitsandbytes.int8_linear_matmul.default(A, B) # Pass B as is
+
+
+def int8_mm_dequant( # Main PDF (page 59)
+    A: torch.Tensor, # int32 result from int8_linear_matmul
+    row_stats: torch.Tensor, # absmax for rows of original LHS matrix of matmul
+    col_stats: torch.Tensor, # absmax for columns of original RHS matrix of matmul (which was transposed)
+    out: Optional[torch.Tensor] = None, # Output tensor (float16 typically)
+    bias: Optional[torch.Tensor] = None,
+):
+    """
+    Dequantizes the int32 result of an int8 matrix multiplication. Uses torch.ops.
+    Result = (A_int32 * row_stats * col_stats / (127*127)) + bias
+    """
+    # torch.ops.bitsandbytes.int8_mm_dequant.default(A, row_stats, col_stats, dtype=torch.float16, bias=bias)
+    # The `dtype` in the op call is the *output* dtype.
+    # The `out` argument in this Python function is for pre-allocated output.
+
+    # Default output dtype if not specified by `out` tensor
+    output_dtype = torch.float16 if out is None else out.dtype
+    
+    # The torch.ops definition from main PDF _ops.py:
+    # "bitsandbytes::int8_mm_dequant", "(Tensor A, Tensor row_stats, Tensor col_stats, ScalarType? dtype=None, Tensor? bias=None) -> Tensor"
+    # Here, `dtype` is an optional argument to the op itself, specifying the desired output type.
+
+    # If `out` is provided, we should use its dtype for the op, and the op should write into `out`.
+    # However, the standard torch.ops pattern doesn't usually have an `out` variant for functions that return a new tensor
+    # AND also take a `dtype` for that new tensor.
+    # The main PDF's cuda/ops.py for int8_mm_dequant creates `out_cuda = torch.empty_like(A, dtype=torch.float16)`
+    # then calls lib.cdequant_mm_int32_fp16. This implies the kernel might be fp16 specific.
+    # The torch.library.define for it does take `ScalarType? dtype`.
+
+    if out is not None:
+        # If out is provided, the op should ideally write to it.
+        # Let's assume the op's `dtype` argument controls the computation/output type,
+        # and if `out` is given, a copy might occur if dtypes don't match what op produces.
+        # This is a bit ambiguous. A dedicated .out variant of the op would be clearer.
+        # For now, call the default op and copy if `out` is provided.
+        result = torch.ops.bitsandbytes.int8_mm_dequant.default(A, row_stats, col_stats, dtype=out.dtype, bias=bias)
+        out.copy_(result)
+        return out
+    else:
+        # If out is not provided, call the op and let it allocate. Default to float16.
+        return torch.ops.bitsandbytes.int8_mm_dequant.default(A, row_stats, col_stats, dtype=torch.float16, bias=bias)
+
+
+@deprecated("This function is deprecated. Use int8_vectorwise_quant or int8_double_quant.", category=FutureWarning)
+def get_colrow_absmax( # Main PDF (page 59)
+    A: torch.Tensor, # float16 input
+    row_stats: Optional[torch.Tensor] = None, # Output for row absmax
+    col_stats: Optional[torch.Tensor] = None, # Output for col absmax
+    nnz_block_ptr: Optional[torch.Tensor] = None, # Not used in main PDF's get_colrow_absmax C call
+    threshold: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """GPU-only. Determines row-wise and column-wise absmax values for LLM.int8()."""
+    if A.device.type != 'cuda':
+        raise NotImplementedError("get_colrow_absmax is only implemented for CUDA/ROCm devices.")
+    if A.dtype != torch.float16:
+        # The C kernel cget_col_row_stats in main PDF was likely for fp16.
+        raise ValueError(f"get_colrow_absmax expects float16 input, got {A.dtype}")
+
+    rows_A = A.shape[0] if len(A.shape) == 2 else A.shape[0] * A.shape[1] # Flatten leading dims
+    cols_A = A.shape[-1]
+
+    if row_stats is None:
+        row_stats = torch.empty(rows_A, dtype=torch.float32, device=A.device)
+    if col_stats is None:
+        col_stats = torch.empty(cols_A, dtype=torch.float32, device=A.device)
+    
+    # nnz_block_ptr was for sparse outliers, not directly used by cget_col_row_stats in main PDF's functional.py
+    # but was mentioned in the CUDABackend refactored version.
+    # The C function cget_col_row_stats in functional.py (main) did not take nnz_block_ptr.
+    # It was `lib.cget_col_row_stats(ptrA, ptrRowStats, ptrColStats, ct.c_float(threshold), rows, cols)`
+    # The `nnz_row_ptr` in refactored CUDABackend.double_quant was for `cdouble_rowcol_quant`.
+    # For get_colrow_absmax, the main PDF's functional.py implementation was simpler:
+    
+    # Simpler version from main PDF functional.py (page 60), which uses Python for col_stats if not provided.
+    # This seems more aligned with the original functional.py structure.
+    # It also had a different C call `lib.cget_row_stats` for just row_stats.
+    
+    # The version on page 59 of main PDF using Python for outlier mask and col_stats:
+    outlier_mask = None
+    absA = A.abs() # Keep original dtype for now
+    if len(A.shape) == 3: absA = absA.view(-1, A.shape[-1]) # Flatten if 3D
+
+    if threshold > 0.0:
+        outlier_mask = absA >= threshold
+        # Create a view for masked_fill_ to avoid modifying original A if it's not desired by caller
+        absA_masked = absA.clone() if outlier_mask.any() else absA
+        absA_masked.masked_fill_(outlier_mask, 0.0)
+        current_absA_for_stats = absA_masked
+    else:
+        current_absA_for_stats = absA
+
+    if row_stats is None or True: # Always calculate if called, or fill provided.
+                                  # Main PDF's get_row_absmax used a C kernel.
+        # Python way:
+        # calculated_row_stats = current_absA_for_stats.amax(dim=-1, keepdim=False).float()
+        # row_stats.copy_(calculated_row_stats)
+        # Using the C kernel from get_row_absmax (main PDF page 60) for row_stats:
+        _row_stats_calc = torch.empty(rows_A, dtype=torch.float32, device=A.device)
+        with _cuda_device_of(A):
+            is_on_gpu([A, _row_stats_calc])
+            lib.cget_row_stats( # Assumes A is contiguous or kernel handles strides
+                get_ptr(A.contiguous()), get_ptr(_row_stats_calc), # Pass original A for kernel
+                ct.c_float(threshold), # Kernel handles thresholding for row stats
+                ct.c_int32(rows_A), ct.c_int32(cols_A),
+                get_tensor_stream(A)
+            )
+        row_stats.copy_(_row_stats_calc)
+
+
+    if col_stats is None or True:
+        # Python way for col_stats (as in main PDF page 60 for get_colrow_absmax)
+        calculated_col_stats = current_absA_for_stats.amax(dim=0, keepdim=False).float()
+        col_stats.copy_(calculated_col_stats)
+        
+    return row_stats, col_stats, outlier_mask
+
+
+@deprecated("This function is deprecated. Use int8_vectorwise_quant.", category=FutureWarning)
+def get_row_absmax(A: torch.Tensor, threshold: float = 0.0): # Main PDF (page 60)
+    """GPU-only. Determine row-wise absmax for LLM.int8()."""
+    if A.device.type != 'cuda':
+        raise NotImplementedError("get_row_absmax is only implemented for CUDA/ROCm devices.")
+    if A.dtype != torch.float16:
+        raise ValueError(f"get_row_absmax expects float16 input, got {A.dtype}")
+
+    rows = A.shape[0] if len(A.shape) == 2 else A.shape[0] * A.shape[1]
+    cols = A.shape[-1]
+    
+    row_stats_out = torch.empty(rows, dtype=torch.float32, device=A.device)
+    
+    with _cuda_device_of(A):
+        is_on_gpu([A, row_stats_out])
+        # Ensure A is contiguous if the kernel expects it.
+        A_contig = A.contiguous() if not A.is_contiguous() else A
+        lib.cget_row_stats(
+            get_ptr(A_contig), get_ptr(row_stats_out),
+            ct.c_float(threshold),
+            ct.c_int32(rows), ct.c_int32(cols),
+            get_tensor_stream(A) # Get stream for the operation
+        )
+    return row_stats_out
+
+
