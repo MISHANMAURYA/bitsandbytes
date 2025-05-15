@@ -196,7 +196,7 @@ def get_cuda_bnb_library_path(cuda_specs: CUDASpecs) -> Path:
 
 class BNBNativeLibrary:
     _lib: ct.CDLL
-    compiled_with_cuda = False # More accurately, compiled_with_gpu
+    compiled_with_cuda = False 
 
     def __init__(self, lib: ct.CDLL):
         self._lib = lib
@@ -204,7 +204,7 @@ class BNBNativeLibrary:
     def __getattr__(self, name):
  
         def throw_on_call(*args, **kwargs):
-            if hasattr(self._lib, name): # Check if the underlying C library has the method
+            if hasattr(self._lib, name): 
                 return getattr(self._lib, name)(*args, **kwargs)
    
             raise RuntimeError(
@@ -246,7 +246,7 @@ def get_available_cuda_binary_versions() -> list[str]:
     versions = []
     for lib_pattern in [lib_pattern_cuda, lib_pattern_rocm]:
         for lib_path in Path(__file__).parent.glob(lib_pattern):
-            # For CUDA: libbitsandbytes_cuda118.so -> 11.8
+
             match_cuda = re.search(r"cuda(\d{3})", lib_path.name)
             if match_cuda:
                 ver_code = int(match_cuda.group(1))
@@ -257,7 +257,7 @@ def get_available_cuda_binary_versions() -> list[str]:
             match_rocm = re.search(r"rocm(\d{2,3})", lib_path.name) 
             if match_rocm:
                 ver_str = match_rocm.group(1)
-                if len(ver_str) == 2: # e.g. "57"
+                if len(ver_str) == 2: 
                     major = int(ver_str[0])
                     minor = int(ver_str[1])
                 elif len(ver_str) == 3: 
@@ -266,7 +266,7 @@ def get_available_cuda_binary_versions() -> list[str]:
                                              
                     if len(ver_str) == 3 and ver_str.startswith('6'): 
                         minor = int(ver_str[1]) 
-                    else: # for 118 style
+                    else: 
                         major = int(ver_str[:2]) if len(ver_str) == 3 else int(ver_str[0])
                         minor = int(ver_str[2]) if len(ver_str) == 3 else int(ver_str[1])
 
@@ -282,7 +282,7 @@ def parse_cuda_version(version_str: str, is_rocm: bool) -> str:
                  return f"{version_str[0]}.{version_str[1]}"
             elif len(version_str) == 3: 
                  return f"{version_str[0]}.{version_str[1]}" 
-        else: # CUDA e.g. "118" -> "11.8"
+        else: 
             if len(version_str) == 3:
                 return f"{version_str[:2]}.{version_str[2]}"
     return version_str  
@@ -339,7 +339,7 @@ class ErrorHandlerMockBNBNativeLibrary(BNBNativeLibrary):
         no_cpu_lib_found = "libbitsandbytes_cpu.so: cannot open" in original_error or \
                            "libbitsandbytes_cpu.dylib: cannot open" in original_error or \
                            "libbitsandbytes_cpu.dll: cannot open" in original_error
-        # Generic "binary not found" check
+   
         no_gpu_lib_found = f"{self.backend_name} binary not found" in original_error or \
                            (not any(self.backend_name in v for v in available_versions) and self.user_gpu_version_tuple is not None)
 
@@ -512,7 +512,7 @@ try:
         HIP_ENVIRONMENT, BNB_HIP_VERSION = False, 0
         BNB_HIP_VERSION_SHORT = ""
         BNB_BACKEND = "CUDA"
-    else: # Neither CUDA nor HIP in torch.version, assume CPU or other non-GPU torch
+    else: 
         HIP_ENVIRONMENT, BNB_HIP_VERSION = False, 0
         BNB_HIP_VERSION_SHORT = ""
         BNB_BACKEND = "CPU" # Or some other indicator
@@ -521,10 +521,10 @@ try:
 
     lib = get_native_library()
 
-except Exception as e: # Catch any error during the initial setup
-    lib = None # Ensure lib is None if setup fails
+except Exception as e:
+    lib = None 
     logger.error(f"bitsandbytes C extension setup failed: {e}", exc_info=True)
-    if torch.cuda.is_available(): # Generic check for any GPU registered with PyTorch as "cuda"
+    if torch.cuda.is_available(): 
         detected_backend = "ROCm" if hasattr(torch.version, 'hip') and torch.version.hip else "CUDA"
         logger.warning(
             f"""
